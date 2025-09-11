@@ -20,20 +20,19 @@
 #include <gflags/gflags.h>
 #include <butil/logging.h>
 #include <brpc/server.h>
+#include <json2pb/pb_to_json.h>
 #include "echo.pb.h"
 
 DEFINE_bool(send_attachment, true, "Carry attachment along with response");
 DEFINE_int32(port, 8003, "TCP Port of this server");
 DEFINE_int32(idle_timeout_s, -1, "Connection will be closed if there is no "
              "read/write operations during the last `idle_timeout_s'");
-DEFINE_int32(logoff_ms, 2000, "Maximum duration of server's LOGOFF state "
-             "(waiting for client to close connection before server stops)");
 
 // Your implementation of example::EchoService
 class EchoServiceImpl : public example::EchoService {
 public:
-    EchoServiceImpl() {};
-    virtual ~EchoServiceImpl() {};
+    EchoServiceImpl() {}
+    virtual ~EchoServiceImpl() {}
     virtual void Echo(google::protobuf::RpcController* cntl_base,
                       const example::EchoRequest* request,
                       example::EchoResponse* response,
@@ -41,9 +40,14 @@ public:
         // This object helps you to call done->Run() in RAII style. If you need
         // to process the request asynchronously, pass done_guard.release().
         brpc::ClosureGuard done_guard(done);
-        
+
         brpc::Controller* cntl =
             static_cast<brpc::Controller*>(cntl_base);
+
+        // optional: set a callback function which is called after response is sent
+        // and before cntl/req/res is destructed.
+        cntl->set_after_rpc_resp_fn(std::bind(&EchoServiceImpl::CallAfterRpc,
+            std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 
         // The purpose of following logs is to help you to understand
         // how clients interact with servers more intuitively. You should 
@@ -66,11 +70,24 @@ public:
             cntl->response_attachment().append("bar");
         }
     }
+
+    // optional
+    static void CallAfterRpc(brpc::Controller* cntl,
+                        const google::protobuf::Message* req,
+                        const google::protobuf::Message* res) {
+        // at this time res is already sent to client, but cntl/req/res is not destructed
+        std::string req_str;
+        std::string res_str;
+        json2pb::ProtoMessageToJson(*req, &req_str, NULL);
+        json2pb::ProtoMessageToJson(*res, &res_str, NULL);
+        LOG(INFO) << "req:" << req_str
+                    << " res:" << res_str;
+    }
 };
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     // Generally you only need one Server.
     brpc::Server server;

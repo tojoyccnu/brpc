@@ -22,7 +22,7 @@
 #include <bthread/countdown_event.h>
 #include "butil/time.h"
 #include "butil/fast_rand.h"
-#include "butil/gperftools_profiler.h"
+#include "gperftools_helper.h"
 
 namespace {
 bool stopped = false;
@@ -55,14 +55,20 @@ int add(void* meta, bthread::TaskIterator<LongIntTask> &iter) {
     return 0;
 }
 
-TEST_F(ExecutionQueueTest, single_thread) {
+void test_single_thread(bool use_pthread) {
     int64_t result = 0;
     int64_t expected_result = 0;
     stopped = false;
     bthread::ExecutionQueueId<LongIntTask> queue_id;
     bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
     ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
-                                                    add, &result));
+                                                add, &result));
     for (int i = 0; i < 100; ++i) {
         expected_result += i;
         ASSERT_EQ(0, bthread::execution_queue_execute(queue_id, i));
@@ -75,17 +81,82 @@ TEST_F(ExecutionQueueTest, single_thread) {
     ASSERT_TRUE(stopped);
 }
 
-struct PushArg {
-    bthread::ExecutionQueueId<LongIntTask> id;
-    butil::atomic<int64_t> total_num;
-    butil::atomic<int64_t> total_time;
-    butil::atomic<int64_t> expected_value;
-    volatile bool stopped;
-    bool wait_task_completed;
-
-    PushArg() {
-        memset(this, 0, sizeof(*this));
+TEST_F(ExecutionQueueTest, single_thread) {
+    for (int i = 0; i < 2; ++i) {
+        test_single_thread(i);
     }
+}
+
+class RValue {
+public:
+    RValue() : _value(0) {}
+    explicit RValue(int v) : _value(v) {}
+    RValue(RValue&& rhs)  noexcept : _value(rhs._value) {}
+    RValue& operator=(RValue&& rhs) noexcept {
+        if (this != &rhs) {
+            _value = rhs._value;
+        }
+        return *this;
+    }
+
+    DISALLOW_COPY_AND_ASSIGN(RValue);
+
+    int value() const { return _value; }
+
+
+private:
+    int _value;
+};
+
+int add(void* meta, bthread::TaskIterator<RValue> &iter) {
+    stopped = iter.is_queue_stopped();
+    int* result = (int*)meta;
+    for (; iter; ++iter) {
+        *result += iter->value();
+    }
+    return 0;
+}
+
+void test_rvalue(bool use_pthread) {
+    int64_t result = 0;
+    int64_t expected_result = 0;
+    stopped = false;
+    bthread::ExecutionQueueId<RValue> queue_id;
+    bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
+    ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
+                                                add, &result));
+    for (int i = 0; i < 100; ++i) {
+        expected_result += i;
+        RValue v(i);
+        ASSERT_EQ(0, bthread::execution_queue_execute(queue_id, std::move(v)));
+    }
+    LOG(INFO) << "stop";
+    ASSERT_EQ(0, bthread::execution_queue_stop(queue_id));
+    ASSERT_NE(0, bthread::execution_queue_execute(queue_id, RValue(0)));
+    ASSERT_EQ(0, bthread::execution_queue_join(queue_id));
+    ASSERT_EQ(expected_result, result);
+    ASSERT_TRUE(stopped);
+}
+
+TEST_F(ExecutionQueueTest, rvalue) {
+    for (int i = 0; i < 2; ++i) {
+        test_rvalue(i);
+    }
+}
+
+struct PushArg {
+    bthread::ExecutionQueueId<LongIntTask> id {0};
+    butil::atomic<int64_t> total_num {0};
+    butil::atomic<int64_t> total_time {0};
+    butil::atomic<int64_t> expected_value {0};
+    volatile bool stopped {false};
+    bool wait_task_completed {false};
 };
 
 void* push_thread(void *arg) {
@@ -135,10 +206,16 @@ void* push_thread_which_addresses_execq(void *arg) {
     return NULL;
 }
 
-TEST_F(ExecutionQueueTest, performance) {
+void test_performance(bool use_pthread) {
     pthread_t threads[8];
     bthread::ExecutionQueueId<LongIntTask> queue_id = { 0 }; // to suppress warnings
     bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
     int64_t result = 0;
     ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
                                                 add, &result));
@@ -160,7 +237,7 @@ TEST_F(ExecutionQueueTest, performance) {
     ProfilerStop();
     ASSERT_EQ(0, bthread::execution_queue_join(queue_id));
     ASSERT_EQ(pa.expected_value.load(), result);
-    LOG(INFO) << "With addressed execq, each execution_queue_execute takes " 
+    LOG(INFO) << "With addressed execq, each execution_queue_execute takes "
               << pa.total_time.load() / pa.total_num.load()
               << " total_num=" << pa.total_num
               << " ns with " << ARRAY_SIZE(threads) << " threads";
@@ -186,11 +263,17 @@ TEST_F(ExecutionQueueTest, performance) {
     ProfilerStop();
     ASSERT_EQ(0, bthread::execution_queue_join(queue_id));
     ASSERT_EQ(pa.expected_value.load(), result);
-    LOG(INFO) << "With id explicitly, execution_queue_execute takes " 
+    LOG(INFO) << "With id explicitly, execution_queue_execute takes "
               << pa.total_time.load() / pa.total_num.load()
               << " total_num=" << pa.total_num
               << " ns with " << ARRAY_SIZE(threads) << " threads";
 #endif  // BENCHMARK_BOTH
+}
+
+TEST_F(ExecutionQueueTest, performance) {
+    for (int i = 0; i < 2; ++i) {
+        test_performance(i);
+    }
 }
 
 volatile bool g_suspending = false;
@@ -230,11 +313,17 @@ int add_with_suspend(void* meta, bthread::TaskIterator<LongIntTask>& iter) {
     return 0;
 }
 
-TEST_F(ExecutionQueueTest, execute_urgent) {
+void test_execute_urgent(bool use_pthread) {
     g_should_be_urgent = false;
     pthread_t threads[10];
     bthread::ExecutionQueueId<LongIntTask> queue_id = { 0 }; // to suppress warnings
     bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
     int64_t result = 0;
     ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
                                                 add_with_suspend, &result));
@@ -257,7 +346,7 @@ TEST_F(ExecutionQueueTest, execute_urgent) {
             usleep(100);
         }
         ASSERT_EQ(0, bthread::execution_queue_execute(
-                      queue_id, -1, &bthread::TASK_OPTIONS_URGENT));
+            queue_id, -1, &bthread::TASK_OPTIONS_URGENT));
         g_suspending = false;
         usleep(100);
     }
@@ -272,11 +361,23 @@ TEST_F(ExecutionQueueTest, execute_urgent) {
     ASSERT_EQ(pa.expected_value.load(), result);
 }
 
-TEST_F(ExecutionQueueTest, urgent_task_is_the_last_task) {
+TEST_F(ExecutionQueueTest, execute_urgent) {
+    for (int i = 0; i < 2; ++i) {
+        test_execute_urgent(i);
+    }
+}
+
+void test_urgent_task_is_the_last_task(bool use_pthread) {
     g_should_be_urgent = false;
     g_suspending = false;
     bthread::ExecutionQueueId<LongIntTask> queue_id = { 0 }; // to suppress warnings
     bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
     int64_t result = 0;
     ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
                                                 add_with_suspend, &result));
@@ -287,11 +388,12 @@ TEST_F(ExecutionQueueTest, urgent_task_is_the_last_task) {
     }
     LOG(INFO) << "Going to push";
     int64_t expected = 0;
-    for (int i = 1; i < 100; ++i) {
-        expected += i;
-        ASSERT_EQ(0, bthread::execution_queue_execute(queue_id, i));
+    for (int j = 1; j < 100; ++j) {
+        expected += j;
+        ASSERT_EQ(0, bthread::execution_queue_execute(queue_id, j));
     }
-    ASSERT_EQ(0, bthread::execution_queue_execute(queue_id, -1, &bthread::TASK_OPTIONS_URGENT));
+    ASSERT_EQ(0, bthread::execution_queue_execute(
+        queue_id, -1, &bthread::TASK_OPTIONS_URGENT));
     usleep(100);
     g_suspending = false;
     butil::atomic_thread_fence(butil::memory_order_acq_rel);
@@ -300,6 +402,11 @@ TEST_F(ExecutionQueueTest, urgent_task_is_the_last_task) {
     ASSERT_EQ(0, bthread::execution_queue_stop(queue_id));
     ASSERT_EQ(0, bthread::execution_queue_join(queue_id));
     ASSERT_EQ(expected, result);
+}
+TEST_F(ExecutionQueueTest, urgent_task_is_the_last_task) {
+    for (int i = 0; i < 2; ++i) {
+        test_urgent_task_is_the_last_task(i);
+    }
 }
 
 long next_task[1024];
@@ -329,11 +436,17 @@ int check_order(void* meta, bthread::TaskIterator<LongIntTask>& iter) {
     return 0;
 }
 
-TEST_F(ExecutionQueueTest, multi_threaded_order) {
+void test_multi_threaded_order(bool use_pthread) {
     memset(next_task, 0, sizeof(next_task));
     long disorder_times = 0;
     bthread::ExecutionQueueId<LongIntTask> queue_id = { 0 }; // to suppress warnings
     bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
     ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
                                                 check_order, &disorder_times));
     pthread_t threads[12];
@@ -348,6 +461,12 @@ TEST_F(ExecutionQueueTest, multi_threaded_order) {
     ASSERT_EQ(0, disorder_times);
 }
 
+TEST_F(ExecutionQueueTest, multi_threaded_order) {
+    for (int i = 0; i < 2; ++i) {
+        test_multi_threaded_order(i);
+    }
+}
+
 int check_running_thread(void* arg, bthread::TaskIterator<LongIntTask>& iter) {
     if (iter.is_queue_stopped()) {
         return 0;
@@ -357,17 +476,29 @@ int check_running_thread(void* arg, bthread::TaskIterator<LongIntTask>& iter) {
     return 0;
 }
 
-TEST_F(ExecutionQueueTest, in_place_task) {
+void test_in_place_task(bool use_pthread) {
     pthread_t thread_id = pthread_self();
     bthread::ExecutionQueueId<LongIntTask> queue_id = { 0 }; // to suppress warnings
     bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
     ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
-                                                check_running_thread, 
+                                                check_running_thread,
                                                 (void*)thread_id));
     ASSERT_EQ(0, bthread::execution_queue_execute(
-                queue_id, 0, &bthread::TASK_OPTIONS_INPLACE));
+        queue_id, 0, &bthread::TASK_OPTIONS_INPLACE));
     ASSERT_EQ(0, bthread::execution_queue_stop(queue_id));
     ASSERT_EQ(0, bthread::execution_queue_join(queue_id));
+}
+
+TEST_F(ExecutionQueueTest, in_place_task) {
+    for (int i = 0; i < 2; ++i) {
+        test_in_place_task(i);
+    }
 }
 
 struct InPlaceTask {
@@ -380,8 +511,8 @@ void *run_first_tasks(void* arg) {
     InPlaceTask task;
     task.first_task = true;
     task.thread_id = pthread_self();
-    EXPECT_EQ(0, bthread::execution_queue_execute(queue_id, task, 
-                                                  &bthread::TASK_OPTIONS_INPLACE));
+    EXPECT_EQ(0, bthread::execution_queue_execute(
+        queue_id, task, &bthread::TASK_OPTIONS_INPLACE));
     return NULL;
 }
 
@@ -408,12 +539,18 @@ int stuck_and_check_running_thread(void* arg, bthread::TaskIterator<InPlaceTask>
     return 0;
 }
 
-TEST_F(ExecutionQueueTest, should_start_new_thread_on_more_tasks) {
+void test_should_start_new_thread_on_more_tasks(bool use_pthread) {
     bthread::ExecutionQueueId<InPlaceTask> queue_id = { 0 };
     bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
     butil::atomic<int> futex(0);
     ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
-                                                stuck_and_check_running_thread, 
+                                                stuck_and_check_running_thread,
                                                 (void*)&futex));
     pthread_t thread;
     ASSERT_EQ(0, pthread_create(&thread, NULL, run_first_tasks, (void*)queue_id.value));
@@ -424,13 +561,19 @@ TEST_F(ExecutionQueueTest, should_start_new_thread_on_more_tasks) {
         InPlaceTask task;
         task.first_task = false;
         task.thread_id = pthread_self();
-        ASSERT_EQ(0, bthread::execution_queue_execute(queue_id, task, 
-                                                      &bthread::TASK_OPTIONS_INPLACE));
+        ASSERT_EQ(0, bthread::execution_queue_execute(
+            queue_id, task, &bthread::TASK_OPTIONS_INPLACE));
     }
     futex.store(2);
     bthread::futex_wake_private(&futex, 1);
     ASSERT_EQ(0, bthread::execution_queue_stop(queue_id));
     ASSERT_EQ(0, bthread::execution_queue_join(queue_id));
+}
+
+TEST_F(ExecutionQueueTest, should_start_new_thread_on_more_tasks) {
+    for (int i = 0; i < 2; ++i) {
+        test_should_start_new_thread_on_more_tasks(i);
+    }
 }
 
 void* inplace_push_thread(void* arg) {
@@ -439,16 +582,22 @@ void* inplace_push_thread(void* arg) {
     LOG(INFO) << "Start thread" << thread_id;
     for (int i = 0; i < 100000; ++i) {
         bthread::execution_queue_execute(id, ((long)thread_id << 32) | i,
-                            &bthread::TASK_OPTIONS_INPLACE);
+                                         &bthread::TASK_OPTIONS_INPLACE);
     }
     return NULL;
 }
 
-TEST_F(ExecutionQueueTest, inplace_and_order) {
+void test_inplace_and_order(bool use_pthread) {
     memset(next_task, 0, sizeof(next_task));
     long disorder_times = 0;
     bthread::ExecutionQueueId<LongIntTask> queue_id = { 0 }; // to suppress warnings
     bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
     ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
                                                 check_order, &disorder_times));
     pthread_t threads[12];
@@ -461,6 +610,12 @@ TEST_F(ExecutionQueueTest, inplace_and_order) {
     ASSERT_EQ(0, bthread::execution_queue_stop(queue_id));
     ASSERT_EQ(0, bthread::execution_queue_join(queue_id));
     ASSERT_EQ(0, disorder_times);
+}
+
+TEST_F(ExecutionQueueTest, inplace_and_order) {
+    for (int i = 0; i < 2; ++i) {
+        test_inplace_and_order(i);
+    }
 }
 
 TEST_F(ExecutionQueueTest, size_of_task_node) {
@@ -488,9 +643,15 @@ int add_with_suspend2(void* meta, bthread::TaskIterator<LongIntTask>& iter) {
     return 0;
 }
 
-TEST_F(ExecutionQueueTest, cancel) {
+void test_cancel(bool use_pthread) {
     bthread::ExecutionQueueId<LongIntTask> queue_id = { 0 }; // to suppress warnings
     bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
     int64_t result = 0;
     ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
                                                 add_with_suspend2, &result));
@@ -512,6 +673,12 @@ TEST_F(ExecutionQueueTest, cancel) {
     ASSERT_EQ(0, result);
 }
 
+TEST_F(ExecutionQueueTest, cancel) {
+    for (int i = 0; i < 2; ++i) {
+        test_cancel(i);
+    }
+}
+
 struct CancelSelf {
     butil::atomic<bthread::TaskHandle*> handle;
 };
@@ -529,9 +696,15 @@ int cancel_self(void* /*meta*/, bthread::TaskIterator<CancelSelf*>& iter) {
     return 0;
 }
 
-TEST_F(ExecutionQueueTest, cancel_self) {
+void test_cancel_self(bool use_pthread) {
     bthread::ExecutionQueueId<CancelSelf*> queue_id = { 0 }; // to suppress warnings
     bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
     ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
                                                 cancel_self, NULL));
     CancelSelf task;
@@ -541,6 +714,12 @@ TEST_F(ExecutionQueueTest, cancel_self) {
     task.handle.store(&handle);
     ASSERT_EQ(0, bthread::execution_queue_stop(queue_id));
     ASSERT_EQ(0, bthread::execution_queue_join(queue_id));
+}
+
+TEST_F(ExecutionQueueTest, cancel_self) {
+    for (int i = 0; i < 2; ++i) {
+        test_cancel_self(i);
+    }
 }
 
 struct AddTask {
@@ -581,7 +760,7 @@ int add_with_cancel(void* meta, bthread::TaskIterator<AddTask>& iter) {
     return 0;
 }
 
-TEST_F(ExecutionQueueTest, random_cancel) {
+void test_random_cancel(bool use_pthread) {
     bthread::ExecutionQueueId<AddTask> queue_id = { 0 };
     AddMeta m;
     m.sum = 0;
@@ -613,8 +792,8 @@ TEST_F(ExecutionQueueTest, random_cancel) {
             t.cancel_task = true;
             t.cancel_value = i;
             t.handle = h;
-            ASSERT_EQ(0, bthread::execution_queue_execute(queue_id, t, 
-                                    &bthread::TASK_OPTIONS_URGENT));
+            ASSERT_EQ(0, bthread::execution_queue_execute(
+                queue_id, t, &bthread::TASK_OPTIONS_URGENT));
         } else {
             // do nothing;
         }
@@ -626,6 +805,12 @@ TEST_F(ExecutionQueueTest, random_cancel) {
     LOG(INFO) << "sum=" << m.sum << " race_times=" << m.race_times
               << " succ_times=" << m.succ_times
               << " fail_times=" << m.fail_times;
+}
+
+TEST_F(ExecutionQueueTest, random_cancel) {
+    for (int i = 0; i < 2; ++i) {
+        test_random_cancel(i);
+    }
 
 }
 
@@ -638,13 +823,19 @@ int add2(void* meta, bthread::TaskIterator<LongIntTask> &iter) {
     return 0;
 }
 
-TEST_F(ExecutionQueueTest, not_do_iterate_at_all) {
+void test_not_do_iterate_at_all(bool use_pthread) {
     int64_t result = 0;
     int64_t expected_result = 0;
     bthread::ExecutionQueueId<LongIntTask> queue_id;
     bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
     ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
-                                                    add2, &result));
+                                                add2, &result));
     for (int i = 0; i < 100; ++i) {
         expected_result += i;
         ASSERT_EQ(0, bthread::execution_queue_execute(queue_id, i));
@@ -653,6 +844,12 @@ TEST_F(ExecutionQueueTest, not_do_iterate_at_all) {
     ASSERT_NE(0, bthread::execution_queue_execute(queue_id, 0));
     ASSERT_EQ(0, bthread::execution_queue_join(queue_id));
     ASSERT_EQ(expected_result, result);
+}
+
+TEST_F(ExecutionQueueTest, not_do_iterate_at_all) {
+    for (int i = 0; i < 2; ++i) {
+        test_not_do_iterate_at_all(i);
+    }
 }
 
 int add_with_suspend3(void* meta, bthread::TaskIterator<LongIntTask>& iter) {
@@ -676,10 +873,16 @@ int add_with_suspend3(void* meta, bthread::TaskIterator<LongIntTask>& iter) {
     return 0;
 }
 
-TEST_F(ExecutionQueueTest, cancel_unexecuted_high_priority_task) {
+void test_cancel_unexecuted_high_priority_task(bool use_pthread) {
     g_should_be_urgent = false;
     bthread::ExecutionQueueId<LongIntTask> queue_id = { 0 }; // to suppress warnings
     bthread::ExecutionQueueOptions options;
+    options.use_pthread = use_pthread;
+    if (options.use_pthread) {
+        LOG(INFO) << "================ pthread ================";
+    } else {
+        LOG(INFO) << "================ bthread ================";
+    }
     int64_t result = 0;
     ASSERT_EQ(0, bthread::execution_queue_start(&queue_id, &options,
                                                 add_with_suspend3, &result));
@@ -693,11 +896,11 @@ TEST_F(ExecutionQueueTest, cancel_unexecuted_high_priority_task) {
     // expecting that both operations are successful.
     bthread::TaskHandle h;
     ASSERT_EQ(0, bthread::execution_queue_execute(
-                        queue_id, -100, &bthread::TASK_OPTIONS_URGENT, &h));
+        queue_id, -100, &bthread::TASK_OPTIONS_URGENT, &h));
     ASSERT_EQ(0, bthread::execution_queue_cancel(h));
-    
+
     // Resume executor
-    g_suspending = false;  
+    g_suspending = false;
 
     // Push a normal task
     ASSERT_EQ(0, bthread::execution_queue_execute(queue_id, 12345));
@@ -707,5 +910,11 @@ TEST_F(ExecutionQueueTest, cancel_unexecuted_high_priority_task) {
     ASSERT_EQ(0, bthread::execution_queue_join(queue_id));
 
     ASSERT_EQ(12345, result);
+}
+
+TEST_F(ExecutionQueueTest, cancel_unexecuted_high_priority_task) {
+    for (int i = 0; i < 2; ++i) {
+        test_cancel_unexecuted_high_priority_task(i);
+    }
 }
 } // namespace

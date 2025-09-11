@@ -20,12 +20,11 @@ include config.mk
 
 # Notes on the flags:
 # 1. Added -fno-omit-frame-pointer: perf/tcmalloc-profiler use frame pointers by default
-# 2. Added -D__const__= : Avoid over-optimizations of TLS variables by GCC>=4.8
-# 3. Removed -Werror: Not block compilation for non-vital warnings, especially when the
-#    code is tested on newer systems. If the code is used in production, add -Werror back
-CPPFLAGS+=-DBTHREAD_USE_FAST_PTHREAD_MUTEX -D__const__= -D_GNU_SOURCE -DUSE_SYMBOLIZE -DNO_TCMALLOC -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -DNDEBUG -DBRPC_REVISION=\"$(shell ./tools/get_brpc_revision.sh .)\"
-CXXFLAGS=$(CPPFLAGS) -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer -std=c++0x
-CFLAGS=$(CPPFLAGS) -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-unused-parameter -fno-omit-frame-pointer
+# 2. Removed -Werror: Not block compilation for non-vital warnings, especially when the
+#    code is tested on newer systems. If the code is used in production, config `config_brpc.sh -werror'.
+CPPFLAGS+=-DBTHREAD_USE_FAST_PTHREAD_MUTEX -D_GNU_SOURCE -DUSE_SYMBOLIZE -DNO_TCMALLOC -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -DNDEBUG -DBRPC_REVISION=\"$(shell ./tools/get_brpc_revision.sh .)\"
+CXXFLAGS+=$(CPPFLAGS) -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer -Wno-deprecated-declarations -Wno-unused-but-set-variable
+CFLAGS=$(CPPFLAGS) -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-unused-parameter -fno-omit-frame-pointer -Wno-deprecated-declarations -Wno-unused-but-set-variable
 DEBUG_CXXFLAGS = $(filter-out -DNDEBUG,$(CXXFLAGS)) -DUNIT_TEST -DBVAR_NOT_LINK_DEFAULT_VARIABLES
 DEBUG_CFLAGS = $(filter-out -DNDEBUG,$(CFLAGS)) -DUNIT_TEST
 HDRPATHS=-I./src $(addprefix -I, $(HDRS))
@@ -41,13 +40,15 @@ endif
 
 #required by butil/crc32.cc to boost performance for 10x
 ifeq ($(shell test $(GCC_VERSION) -ge 40400; echo $$?),0)
-	CXXFLAGS+=-msse4 -msse4.2
+  ifeq ($(shell uname -p),i386)  #note: i386 is processor family type, not the 32-bit x86 arch
+    CXXFLAGS+=-msse4 -msse4.2
+  endif
 endif
 #not solved yet
 ifeq ($(CC),gcc)
- ifeq ($(shell test $(GCC_VERSION) -ge 70000; echo $$?),0)
-	CXXFLAGS+=-Wno-aligned-new
- endif
+  ifeq ($(shell test $(GCC_VERSION) -ge 70000; echo $$?),0)
+    CXXFLAGS+=-Wno-aligned-new
+  endif
 endif
 
 BUTIL_SOURCES = \
@@ -67,6 +68,7 @@ BUTIL_SOURCES = \
     src/butil/at_exit.cc \
     src/butil/atomicops_internals_x86_gcc.cc \
     src/butil/base64.cc \
+    src/butil/base64url.cc \
     src/butil/big_endian.cc \
     src/butil/cpu.cc \
     src/butil/debug/alias.cc \
@@ -150,6 +152,7 @@ BUTIL_SOURCES = \
     src/butil/status.cpp \
     src/butil/string_printf.cpp \
     src/butil/thread_local.cpp \
+    src/butil/thread_key.cpp \
     src/butil/unix_socket.cpp \
     src/butil/endpoint.cpp \
     src/butil/fd_utility.cpp \
@@ -160,6 +163,8 @@ BUTIL_SOURCES = \
     src/butil/crc32c.cc \
     src/butil/containers/case_ignored_flat_map.cpp \
     src/butil/iobuf.cpp \
+    src/butil/single_iobuf.cpp \
+    src/butil/iobuf_profiler.cpp \
     src/butil/binary_printer.cpp \
     src/butil/recordio.cc \
     src/butil/popen.cpp
@@ -193,10 +198,11 @@ JSON2PB_DIRS = src/json2pb
 JSON2PB_SOURCES = $(foreach d,$(JSON2PB_DIRS),$(wildcard $(addprefix $(d)/*,$(SRCEXTS))))
 JSON2PB_OBJS = $(addsuffix .o, $(basename $(JSON2PB_SOURCES))) 
 
-BRPC_DIRS = src/brpc src/brpc/details src/brpc/builtin src/brpc/policy
+BRPC_DIRS = src/brpc src/brpc/details src/brpc/builtin src/brpc/policy src/brpc/rdma
 THRIFT_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/thrift*,$(SRCEXTS))))
+EXCLUDE_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/event_dispatcher_*,$(SRCEXTS))))
 BRPC_SOURCES_ALL = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/*,$(SRCEXTS))))
-BRPC_SOURCES = $(filter-out $(THRIFT_SOURCES), $(BRPC_SOURCES_ALL))
+BRPC_SOURCES = $(filter-out $(THRIFT_SOURCES) $(EXCLUDE_SOURCES), $(BRPC_SOURCES_ALL))
 BRPC_PROTOS = $(filter %.proto,$(BRPC_SOURCES))
 BRPC_CFAMILIES = $(filter-out %.proto %.pb.cc,$(BRPC_SOURCES))
 BRPC_OBJS = $(BRPC_PROTOS:.proto=.pb.o) $(addsuffix .o, $(basename $(BRPC_CFAMILIES)))
@@ -239,9 +245,9 @@ clean_debug:
 protoc-gen-mcpack: src/idl_options.pb.cc src/mcpack2pb/generator.o libbrpc.a
 	@echo "> Linking $@"
 ifeq ($(SYSTEM),Linux)
-	$(CXX) -o $@ $(HDRPATHS) $(LIBPATHS) -std=c++0x -Xlinker "-(" $^ -Wl,-Bstatic $(STATIC_LINKINGS) -Wl,-Bdynamic -Xlinker "-)" $(DYNAMIC_LINKINGS)
+	$(CXX) -o $@ $(CXXFLAGS) $(HDRPATHS) $(LIBPATHS) -Xlinker "-(" $^ -Wl,-Bstatic $(STATIC_LINKINGS) -Wl,-Bdynamic -Xlinker "-)" $(DYNAMIC_LINKINGS)
 else ifeq ($(SYSTEM),Darwin)
-	$(CXX) -o $@ $(HDRPATHS) $(LIBPATHS) -std=c++0x $^ $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS)
+	$(CXX) -o $@ $(CXXFLAGS) $(HDRPATHS) $(LIBPATHS) $^ $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS)
 endif
 
 # force generation of pb headers before compiling to avoid fail-to-import issues in compiling pb.cc
@@ -291,6 +297,9 @@ output/bin:protoc-gen-mcpack
 %.pb.cc %.pb.h:%.proto
 	@echo "> Generating $@"
 	$(PROTOC) --cpp_out=./src --proto_path=./src --proto_path=$(PROTOBUF_HDR) $<
+
+src/mcpack2pb/generator.o:src/mcpack2pb/generator.cpp src/idl_options.pb.h
+	$(CXX) -c $(HDRPATHS) $(CXXFLAGS) $< -o $@
 
 %.o:%.cpp
 	@echo "> Compiling $@"

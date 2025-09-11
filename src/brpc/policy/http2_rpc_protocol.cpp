@@ -204,7 +204,6 @@ bool ParseH2Settings(H2Settings* out, butil::IOBufBytesIterator& it, size_t n) {
         default:
             // An endpoint that receives a SETTINGS frame with any unknown or
             // unsupported identifier MUST ignore that setting (section 6.5.2)
-            LOG(WARNING) << "Unknown setting, id=" << id << " value=" << value;
             break;
         }
     }
@@ -363,17 +362,15 @@ H2Context::~H2Context() {
 
 int H2Context::Init() {
     if (_pending_streams.init(64, 70) != 0) {
-        LOG(ERROR) << "Fail to init _pending_streams";
-        return -1;
+        LOG(WARNING) << "Fail to init _pending_streams";
     }
     if (_hpacker.Init(_unack_local_settings.header_table_size) != 0) {
-        LOG(ERROR) << "Fail to init _hpacker";
-        return -1;
+        LOG(WARNING) << "Fail to init _hpacker";
     }
     return 0;
 }
 
-H2StreamContext* H2Context::RemoveStream(int stream_id) {
+H2StreamContext* H2Context::RemoveStreamAndDeferWU(int stream_id) {
     H2StreamContext* sctx = NULL;
     {
         std::unique_lock<butil::Mutex> mu(_stream_mutex);
@@ -517,7 +514,7 @@ ParseResult H2Context::Consume(
                 LOG(WARNING) << "Fail to send RST_STREAM to " << *_socket;
                 return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
             }
-            H2StreamContext* sctx = RemoveStream(h2_res.stream_id());
+            H2StreamContext* sctx = RemoveStreamAndDeferWU(h2_res.stream_id());
             if (sctx) {
                 if (is_server_side()) {
                     delete sctx;
@@ -743,8 +740,13 @@ H2ParseResult H2StreamContext::OnData(
         }
     }
 
-    const int64_t acc = _deferred_window_update.fetch_add(frag_size, butil::memory_order_relaxed) + frag_size;
-    if (acc >= _conn_ctx->local_settings().stream_window_size / 2) {
+    int64_t acc = frag_size +
+        _deferred_window_update.fetch_add(frag_size, butil::memory_order_relaxed);
+    int64_t quota = static_cast<int64_t>(
+        _conn_ctx->local_settings().stream_window_size /
+        (_conn_ctx->VolatilePendingStreamSize() + 1));
+    // Allocate the quota of the window to each stream.
+    if (acc >= quota) {
         if (acc > _conn_ctx->local_settings().stream_window_size) {
             LOG(ERROR) << "Fail to satisfy the stream-level flow control policy";
             return MakeH2Error(H2_FLOW_CONTROL_ERROR, frame_head.stream_id);
@@ -805,7 +807,7 @@ H2ParseResult H2StreamContext::OnResetStream(
         return MakeH2Error(H2_PROTOCOL_ERROR);
     }
 #endif
-    H2StreamContext* sctx = _conn_ctx->RemoveStream(stream_id());
+    H2StreamContext* sctx = _conn_ctx->RemoveStreamAndDeferWU(stream_id());
     if (sctx == NULL) {
         LOG(ERROR) << "Fail to find stream_id=" << stream_id();
         return MakeH2Error(H2_PROTOCOL_ERROR);
@@ -832,7 +834,7 @@ H2ParseResult H2StreamContext::OnEndStream() {
         return MakeH2Error(H2_PROTOCOL_ERROR);
     }
 #endif
-    H2StreamContext* sctx = _conn_ctx->RemoveStream(stream_id());
+    H2StreamContext* sctx = _conn_ctx->RemoveStreamAndDeferWU(stream_id());
     if (sctx == NULL) {
         RPC_VLOG << "Fail to find stream_id=" << stream_id();
         return MakeH2Message(NULL);
@@ -1141,20 +1143,16 @@ void H2Context::AddAbandonedStream(uint32_t stream_id) {
 }
 
 inline void H2Context::ClearAbandonedStreams() {
-    if (!_abandoned_streams.empty()) {
-        ClearAbandonedStreamsImpl();
-    }
-}
-
-void H2Context::ClearAbandonedStreamsImpl() {
     std::unique_lock<butil::Mutex> mu(_abandoned_streams_mutex);
     while (!_abandoned_streams.empty()) {
         const uint32_t stream_id = _abandoned_streams.back();
         _abandoned_streams.pop_back();
-        H2StreamContext* sctx = RemoveStream(stream_id);
+        mu.unlock();
+        H2StreamContext* sctx = RemoveStreamAndDeferWU(stream_id);
         if (sctx != NULL) {
             delete sctx;
         }
+        mu.lock();
     }
 }
 
@@ -1286,15 +1284,14 @@ int H2StreamContext::ConsumeHeaders(butil::IOBufBytesIterator& it) {
                    strcmp(name + 1, /*c*/"ontent-type") == 0) {
             h.set_content_type(pair.value);
         } else {
-            // TODO: AppendHeader?
-            h.SetHeader(pair.name, pair.value);
+            h.AppendHeader(pair.name, pair.value);
         }
 
         if (FLAGS_http_verbose) {
-            butil::IOBufBuilder* vs = this->_vmsgbuilder;
+            butil::IOBufBuilder* vs = this->_vmsgbuilder.get();
             if (vs == NULL) {
                 vs = new butil::IOBufBuilder;
-                this->_vmsgbuilder = vs;
+                this->_vmsgbuilder.reset(vs);
                 if (_conn_ctx->is_server_side()) {
                     *vs << "[ H2 REQUEST @" << butil::my_ip() << " ]";
                 } else {
@@ -1574,6 +1571,10 @@ H2UnsentRequest::AppendAndDestroySelf(butil::IOBuf* out, Socket* socket) {
     HPackOptions options;
     options.encode_name = FLAGS_h2_hpack_encode_name;
     options.encode_value = FLAGS_h2_hpack_encode_value;
+    if (ctx->remote_settings().header_table_size == 0) {
+        options.index_policy = HPACK_NEVER_INDEX_HEADER;
+    }
+    
     for (size_t i = 0; i < _size; ++i) {
         hpacker.Encode(&appender, _list[i], options);
     }
@@ -1715,6 +1716,9 @@ H2UnsentResponse::AppendAndDestroySelf(butil::IOBuf* out, Socket* socket) {
     HPackOptions options;
     options.encode_name = FLAGS_h2_hpack_encode_name;
     options.encode_value = FLAGS_h2_hpack_encode_value;
+    if (ctx->remote_settings().header_table_size == 0) {
+        options.index_policy = HPACK_NEVER_INDEX_HEADER;
+    }
 
     for (size_t i = 0; i < _size; ++i) {
         hpacker.Encode(&appender, _list[i], options);

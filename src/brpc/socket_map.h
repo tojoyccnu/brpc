@@ -80,11 +80,20 @@ struct SocketMapKeyHasher {
 // successfully, SocketMapRemove() MUST be called when the Socket is not needed.
 // Return 0 on success, -1 otherwise.
 int SocketMapInsert(const SocketMapKey& key, SocketId* id,
-                    const std::shared_ptr<SocketSSLContext>& ssl_ctx);
+                    const std::shared_ptr<SocketSSLContext>& ssl_ctx,
+                    bool use_rdma,
+                    const HealthCheckOption& hc_option);
+
+inline int SocketMapInsert(const SocketMapKey& key, SocketId* id,
+                    const std::shared_ptr<SocketSSLContext>& ssl_ctx) {
+    HealthCheckOption hc_option;
+    return SocketMapInsert(key, id, ssl_ctx, false, hc_option);
+}
 
 inline int SocketMapInsert(const SocketMapKey& key, SocketId* id) {
     std::shared_ptr<SocketSSLContext> empty_ptr;
-    return SocketMapInsert(key, id, empty_ptr);
+    HealthCheckOption hc_option;
+    return SocketMapInsert(key, id, empty_ptr, false, hc_option);
 }
 
 // Find the SocketId associated with `key'.
@@ -119,7 +128,7 @@ struct SocketMapOptions {
     // Initial size of the map (proper size reduces number of resizes)
     // Default: 1024
     size_t suggested_map_size;
-    
+  
     // Pooled connections without data transmission for so many seconds will
     // be closed. No effect for non-positive values.
     // If idle_timeout_second_dynamic is not NULL, use the dereferenced value
@@ -144,10 +153,19 @@ public:
     ~SocketMap();
     int Init(const SocketMapOptions&);
     int Insert(const SocketMapKey& key, SocketId* id,
-               const std::shared_ptr<SocketSSLContext>& ssl_ctx);
+               const std::shared_ptr<SocketSSLContext>& ssl_ctx,
+               bool use_rdma,
+               const HealthCheckOption& hc_option);
+
+    int Insert(const SocketMapKey& key, SocketId* id,
+               const std::shared_ptr<SocketSSLContext>& ssl_ctx) {
+        HealthCheckOption hc_option;
+        return Insert(key, id, ssl_ctx, false, hc_option);   
+    }
     int Insert(const SocketMapKey& key, SocketId* id) {
         std::shared_ptr<SocketSSLContext> empty_ptr;
-        return Insert(key, id, empty_ptr);
+        HealthCheckOption hc_option;
+        return Insert(key, id, empty_ptr, false, hc_option);
     }
 
     void Remove(const SocketMapKey& key, SocketId expected_id);
@@ -159,11 +177,13 @@ public:
 private:
     void RemoveInternal(const SocketMapKey& key, SocketId id,
                         bool remove_orphan);
+    static void ReleaseReference(Socket* s);
     void ListOrphans(int64_t defer_us, std::vector<SocketMapKey>* out);
     void WatchConnections();
     static void* RunWatchConnections(void*);
     void Print(std::ostream& os);
     static void PrintSocketMap(std::ostream& os, void* arg);
+    void ShowSocketMapInBvarIfNeed();
 
 private:
     struct SingleConnection {
@@ -179,7 +199,7 @@ private:
     SocketMapOptions _options;
     butil::Mutex _mutex;
     Map _map;
-    bool _exposed_in_bvar;
+    butil::atomic<bool> _exposed_in_bvar;
     bvar::PassiveStatus<std::string>* _this_map_bvar;
     bool _has_close_idle_thread;
     bthread_t _close_idle_thread;

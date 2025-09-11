@@ -32,6 +32,9 @@
 
 #include <iosfwd>
 #include <string>
+#if __cplusplus >= 201703L
+#include <string_view>
+#endif // __cplusplus >= 201703L
 
 #include "butil/base_export.h"
 #include "butil/basictypes.h"
@@ -155,7 +158,7 @@ BUTIL_EXPORT StringPiece16 substr(const StringPiece16& self,
 
 // Defines the types, methods, operators, and data members common to both
 // StringPiece and StringPiece16. Do not refer to this class directly, but
-// rather to BasicStringPiece, StringPiece, or StringPiece16.
+// rather to StringPiece, or StringPiece16.
 //
 // This is templatized by string class type rather than character type, so
 // BasicStringPiece<std::string> or BasicStringPiece<butil::string16>.
@@ -165,6 +168,7 @@ template <typename STRING_TYPE> class BasicStringPiece {
   typedef size_t size_type;
   typedef typename STRING_TYPE::value_type value_type;
   typedef const value_type* pointer;
+  typedef const value_type* const_pointer;
   typedef const value_type& reference;
   typedef const value_type& const_reference;
   typedef ptrdiff_t difference_type;
@@ -181,10 +185,17 @@ template <typename STRING_TYPE> class BasicStringPiece {
   BasicStringPiece(const value_type* str)
       : ptr_(str),
         length_((str == NULL) ? 0 : STRING_TYPE::traits_type::length(str)) {}
+#if __cplusplus >= 201703L
+  BasicStringPiece(
+    const std::basic_string_view<value_type, typename STRING_TYPE::traits_type>& str)
+      : ptr_(str.data()), length_(str.size()) {}
+#endif // __cplusplus >= 201703L
   BasicStringPiece(const STRING_TYPE& str)
       : ptr_(str.data()), length_(str.size()) {}
   BasicStringPiece(const value_type* offset, size_type len)
       : ptr_(offset), length_(len) {}
+  BasicStringPiece(const BasicStringPiece& str, size_type pos, size_type len = npos)
+      : ptr_(str.data() + pos), length_(std::min(len, str.length() - pos)) {}
   BasicStringPiece(const typename STRING_TYPE::const_iterator& begin,
                     const typename STRING_TYPE::const_iterator& end)
       : ptr_((end > begin) ? &(*begin) : NULL),
@@ -202,6 +213,11 @@ template <typename STRING_TYPE> class BasicStringPiece {
   void clear() {
     ptr_ = NULL;
     length_ = 0;
+  }
+  BasicStringPiece& assign(const BasicStringPiece& str, size_type pos, size_type len = npos) {
+    ptr_ = str.data() + pos;
+    length_ = std::min(len, str.length() - pos);
+    return *this;
   }
   void set(const value_type* data, size_type len) {
     ptr_ = data;
@@ -362,6 +378,14 @@ template <typename STRING_TYPE> class BasicStringPiece {
     return internal::substr(*this, pos, n);
   }
 
+  // Converts to `std::basic_string`.
+  explicit operator STRING_TYPE() const {
+    if (NULL == data()) {
+      return {};
+    }
+    return STRING_TYPE(data(), size());
+  }
+
  protected:
   const value_type* ptr_;
   size_type     length_;
@@ -378,7 +402,7 @@ extern template class BUTIL_EXPORT BasicStringPiece<std::string>;
 extern template class BUTIL_EXPORT BasicStringPiece<string16>;
 #endif
 
-// StingPiece operators --------------------------------------------------------
+// StringPiece operators --------------------------------------------------------
 
 BUTIL_EXPORT bool operator==(const StringPiece& x, const StringPiece& y);
 

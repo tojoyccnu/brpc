@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// bthread - A M:N threading library to make applications more concurrent.
+// bthread - An M:N threading library to make applications more concurrent.
 
 // Date: 2016/04/16 18:43:24
 
 #include "bthread/execution_queue.h"
 
 #include "butil/memory/singleton_on_pthread_once.h"
-#include "butil/object_pool.h"           // butil::get_object
 #include "butil/resource_pool.h"         // butil::get_resource
+#include "butil/threading/platform_thread.h"
 
 namespace bthread {
 
@@ -67,12 +67,12 @@ inline ExecutionQueueVars* get_execq_vars() {
 
 void ExecutionQueueBase::start_execute(TaskNode* node) {
     node->next = TaskNode::UNCONNECTED;
-    node->status = UNEXECUTED;
+    node->status = TaskNode::UNEXECUTED;
     node->iterated = false;
     if (node->high_priority) {
         // Add _high_priority_tasks before pushing this task into queue to
         // make sure that _execute_tasks sees the newest number when this 
-        // task is in the queue. Althouth there might be some useless for 
+        // task is in the queue. Although there might be some useless for 
         // loops in _execute_tasks if this thread is scheduled out at this 
         // point, we think it's just fine.
         _high_priority_tasks.fetch_add(1, butil::memory_order_relaxed);
@@ -105,16 +105,34 @@ void ExecutionQueueBase::start_execute(TaskNode* node) {
     }
 
     if (nullptr == _options.executor) {
-        bthread_t tid;
-        // We start the execution thread in background instead of foreground as
-        // we can't determine whether the code after execute() is urgent (like
-        // unlock a pthread_mutex_t) in which case implicit context switch may
-        // cause undefined behavior (e.g. deadlock)
-        if (bthread_start_background(&tid, &_options.bthread_attr,
-                                     _execute_tasks, node) != 0) {
-            PLOG(FATAL) << "Fail to start bthread";
-            _execute_tasks(node);
+        if (_options.use_pthread) {
+            if (_pthread_started) {
+                BAIDU_SCOPED_LOCK(_mutex);
+                _current_head = node;
+                _cond.Signal();
+            } else {
+                // Start the execution bthread in background once.
+                if (pthread_create(&_pid, NULL,
+                                   _execute_tasks_pthread,
+                                   node) != 0) {
+                    PLOG(FATAL) << "Fail to create pthread";
+                    _execute_tasks(node);
+                }
+                _pthread_started = true;
+            }
+        } else {
+            bthread_t tid;
+            // We start the execution bthread in background instead of foreground as
+            // we can't determine whether the code after execute() is urgent (like
+            // unlock a pthread_mutex_t) in which case implicit context switch may
+            // cause undefined behavior (e.g. deadlock)
+            if (bthread_start_background(&tid, &_options.bthread_attr,
+                _execute_tasks, node) != 0) {
+                PLOG(FATAL) << "Fail to start bthread";
+                _execute_tasks(node);
+            }
         }
+
     } else {
         if (_options.executor->submit(_execute_tasks, node) != 0) {
             PLOG(FATAL) << "Fail to submit task";
@@ -176,16 +194,38 @@ void* ExecutionQueueBase::_execute_tasks(void* arg) {
         CHECK(m->_stopped);
         // Add _join_butex by 2 to make it equal to the next version of the
         // ExecutionQueue from the same slot so that join with old id would
-        // return immediatly.
+        // return immediately.
         // 
-        // 1: release fence to make join sees the newst changes when it sees
-        //    the newst _join_butex
+        // 1: release fence to make join sees the newest changes when it sees
+        //    the newest _join_butex
         m->_join_butex->fetch_add(2, butil::memory_order_release/*1*/);
         butex_wake_all(m->_join_butex);
         vars->execq_count << -1;
         butil::return_resource(slot_of_id(m->_this_id));
     }
     vars->execq_active_count << -1;
+    return NULL;
+}
+
+void* ExecutionQueueBase::_execute_tasks_pthread(void* arg) {
+    butil::PlatformThread::SetName("ExecutionQueue");
+    auto head = (TaskNode*)arg;
+    auto m = (ExecutionQueueBase*)head->q;
+    m->_current_head = head;
+    while (true) {
+        BAIDU_SCOPED_LOCK(m->_mutex);
+        while (!m->_current_head) {
+            m->_cond.Wait();
+        }
+        _execute_tasks(m->_current_head);
+        m->_current_head = NULL;
+
+        int expected = _version_of_id(m->_this_id);
+        if (expected != m->_join_butex->load(butil::memory_order_relaxed)) {
+            // Execute queue has been stopped and stopped task has been executed, quit.
+            break;
+        }
+    }
     return NULL;
 }
 
@@ -227,6 +267,10 @@ int ExecutionQueueBase::join(uint64_t id) {
             return errno;
         }
     }
+    // Join pthread if it's started.
+    if (m->_options.use_pthread && m->_pthread_started) {
+        pthread_join(m->_pid, NULL);
+    }
     return 0;
 }
 
@@ -259,7 +303,7 @@ int ExecutionQueueBase::_execute(TaskNode* head, bool high_priority, int* nitera
     if (head != NULL && head->stop_task) {
         CHECK(head->next == NULL);
         head->iterated = true;
-        head->status = EXECUTED;
+        head->status = TaskNode::EXECUTED;
         TaskIteratorBase iter(NULL, this, true, false);
         _execute_func(_meta, _type_specific_function, iter);
         if (niterated) {
@@ -321,7 +365,7 @@ ExecutionQueueBase::scoped_ptr_t ExecutionQueueBase::address(uint64_t id) {
                         // We don't return m immediatly when the reference count
                         // reaches 0 as there might be in processing tasks. Instead
                         // _on_recycle would push a `stop_task', after which
-                        // is excuted m would be finally reset and returned
+                        // is executed m would be finally reset and returned
                     }
                 } else {
                     CHECK(false) << "ref-version=" << ver1
@@ -365,6 +409,8 @@ int ExecutionQueueBase::create(uint64_t* id, const ExecutionQueueOptions* option
                 _version_of_vref(m->_versioned_ref.fetch_add(
                                     1, butil::memory_order_release)), slot);
         *id = m->_this_id;
+        m->_pthread_started = false;
+        m->_current_head = NULL;
         get_execq_vars()->execq_count << 1;
         return 0;
     }

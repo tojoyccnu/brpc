@@ -21,7 +21,7 @@ project(grpc_c++ C CXX)
 option(LINK_SO "Whether examples are linked dynamically" OFF)
 
 execute_process(
-    COMMAND bash -c "find ${CMAKE_SOURCE_DIR}/../.. -type d -regex \".*output/include$\" | head -n1 | xargs dirname | tr -d '\n'"
+    COMMAND bash -c "find ${PROJECT_SOURCE_DIR}/../.. -type d -regex \".*output/include$\" | head -n1 | xargs dirname | tr -d '\n'"
     OUTPUT_VARIABLE OUTPUT_PATH
 )
 
@@ -55,17 +55,6 @@ if((NOT GFLAGS_INCLUDE_PATH) OR (NOT GFLAGS_LIBRARY))
 endif()
 include_directories(${GFLAGS_INCLUDE_PATH})
 
-execute_process(
-    COMMAND bash -c "grep \"namespace [_A-Za-z0-9]\\+ {\" ${GFLAGS_INCLUDE_PATH}/gflags/gflags_declare.h | head -1 | awk '{print $2}' | tr -d '\n'"
-    OUTPUT_VARIABLE GFLAGS_NS
-)
-if(${GFLAGS_NS} STREQUAL "GFLAGS_NAMESPACE")
-    execute_process(
-        COMMAND bash -c "grep \"#define GFLAGS_NAMESPACE [_A-Za-z0-9]\\+\" ${GFLAGS_INCLUDE_PATH}/gflags/gflags_declare.h | head -1 | awk '{print $3}' | tr -d '\n'"
-        OUTPUT_VARIABLE GFLAGS_NS
-    )
-endif()
-
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     include(CheckFunctionExists)
     CHECK_FUNCTION_EXISTS(clock_gettime HAVE_CLOCK_GETTIME)
@@ -74,8 +63,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     endif()
 endif()
 
-set(CMAKE_CPP_FLAGS "${DEFINE_CLOCK_GETTIME} -DGFLAGS_NS=${GFLAGS_NS}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS} -DNDEBUG -O2 -D__const__= -pipe -W -Wall -Wno-unused-parameter -fPIC -fno-omit-frame-pointer")
+set(CMAKE_CXX_FLAGS "${DEFINE_CLOCK_GETTIME} -DNDEBUG -O2 -D__const__=__unused__ -pipe -W -Wall -Wno-unused-parameter -fPIC -fno-omit-frame-pointer")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBRPC_ENABLE_CPU_PROFILER")
 
 if(CMAKE_VERSION VERSION_LESS "3.1.3")
@@ -97,23 +85,23 @@ if ((NOT LEVELDB_INCLUDE_PATH) OR (NOT LEVELDB_LIB))
 endif()
 include_directories(${LEVELDB_INCLUDE_PATH})
 
-find_library(SSL_LIB NAMES ssl)
-if (NOT SSL_LIB)
-    message(FATAL_ERROR "Fail to find ssl")
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(OPENSSL_ROOT_DIR
+        "/usr/local/opt/openssl"    # Homebrew installed OpenSSL
+        )
 endif()
 
-find_library(CRYPTO_LIB NAMES crypto)
-if (NOT CRYPTO_LIB)
-    message(FATAL_ERROR "Fail to find crypto")
-endif()
+find_package(OpenSSL)
+include_directories(${OPENSSL_INCLUDE_DIR})
 
 set(DYNAMIC_LIB
     ${CMAKE_THREAD_LIBS_INIT}
     ${GFLAGS_LIBRARY}
     ${PROTOBUF_LIBRARIES}
     ${LEVELDB_LIB}
-    ${SSL_LIB}
-    ${CRYPTO_LIB}
+    ${OPENSSL_CRYPTO_LIBRARY}
+    ${OPENSSL_SSL_LIBRARY}
+    ${THRIFT_LIB}
     dl
     )
 
@@ -129,7 +117,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         "-Wl,-U,_MallocExtension_ReleaseFreeMemory"
         "-Wl,-U,_ProfilerStart"
         "-Wl,-U,_ProfilerStop"
-        "-Wl,-U,_RegisterThriftProtocol")
+        "-Wl,-U,__Z13GetStackTracePPvii"
+        "-Wl,-U,_RegisterThriftProtocol"
+        "-Wl,-U,_mallctl"
+        "-Wl,-U,_malloc_stats_print"
+    )
 endif()
 
 add_executable(server server.cpp ${PROTO_SRC} ${PROTO_HEADER} )

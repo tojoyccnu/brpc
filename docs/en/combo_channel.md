@@ -17,9 +17,13 @@ We need a better abstraction. If several channels are combined into a larger one
 - Support cancellation.
 - Support timeout.
 
-Check [example/parallel_echo_c++](https://github.com/brpc/brpc/tree/master/example/parallel_echo_c++/) for an example.
+Check [example/parallel_echo_c++](https://github.com/apache/brpc/tree/master/example/parallel_echo_c++/) for an example.
 
-Any subclasses of `brpc::ChannelBase` can be added into `ParallelChannel`, including `ParallelChannel` and other combo channels. Set `ParallelChannelOptions.fail_limit` to control maximum number of failures. When number of failed responses reaches the limit, the RPC is ended immediately rather than waiting for timeout.
+Any subclasses of `brpc::ChannelBase` can be added into `ParallelChannel`, including `ParallelChannel` and other combo channels. 
+
+Set `ParallelChannelOptions.fail_limit` to control maximum number of failures. When number of failed responses reaches the limit, the RPC is ended immediately rather than waiting for timeout.
+
+Set `ParallelChannelOptions.sucess_limit` to control maximum number of successful responses. When number of successful responses reaches the limit, the RPC is ended immediately.`ParallelChannelOptions.fail_limit` has a higher priority than `ParallelChannelOptions.success_limit`. Success_limit will take effect only when fail_limit is not set.
 
 A sub channel can be added to the same `ParallelChannel` more than once, which is useful when you need to initiate multiple asynchronous RPC to the same service and wait for their completions.
 
@@ -52,6 +56,7 @@ public:
     virtual ~CallMapper();
  
     virtual SubCall Map(int channel_index/*starting from 0*/,
+                        int channel_count,
                         const google::protobuf::MethodDescriptor* method,
                         const google::protobuf::Message* request,
                         google::protobuf::Message* response) = 0;
@@ -59,6 +64,8 @@ public:
 ```
 
 `channel_index`: The position of the sub channel inside `ParallelChannel`, starting from zero.
+
+`channel_count`: The sub channel count inside `ParallelChannel`.
 
 `method/request/response`: Parameters to `ParallelChannel::CallMethod()`.
 
@@ -159,14 +166,14 @@ const Controller* sub(int index) const;
 
 # SelectiveChannel
 
-[SelectiveChannel](https://github.com/brpc/brpc/blob/master/src/brpc/selective_channel.h) (referred to as "schan" sometimes) accesses one of the internal sub channels with a load balancing algorithm. It's more high-level compared to ordinary channels: The requests are sent to sub channels instead of servers directly. `SelectiveChannel` is mainly for load balancing between groups of machines and shares basic properties of `Channel`:
+[SelectiveChannel](https://github.com/apache/brpc/blob/master/src/brpc/selective_channel.h) (referred to as "schan" sometimes) accesses one of the internal sub channels with a load balancing algorithm. It's more high-level compared to ordinary channels: The requests are sent to sub channels instead of servers directly. `SelectiveChannel` is mainly for load balancing between groups of machines and shares basic properties of `Channel`:
 
 - Support synchronous and asynchronous accesses.
 - Can be destroyed immediately after initiating an asynchronous operation.
 - Support cancellation.
 - Support timeout.
 
-Check [example/selective_echo_c++](https://github.com/brpc/brpc/tree/master/example/selective_echo_c++/) for an example.
+Check [example/selective_echo_c++](https://github.com/apache/brpc/tree/master/example/selective_echo_c++/) for an example.
 
 Any subclasses of `brpc::ChannelBase` can be added into `SelectiveChannel`, including `SelectiveChannel` and other combo channels. 
 
@@ -252,9 +259,9 @@ stub.FooMethod(&cntl, &request, &response, NULL);
 
 # PartitionChannel
 
-[PartitionChannel](https://github.com/brpc/brpc/blob/master/src/brpc/partition_channel.h) is a specialized `ParallelChannel` to add sub channels automatically based on tags defined in the naming service. As a result, users can list all machines in one naming service and partition them by tags. Check [example/partition_echo_c++](https://github.com/brpc/brpc/tree/master/example/partition_echo_c++/) for an example.
+[PartitionChannel](https://github.com/apache/brpc/blob/master/src/brpc/partition_channel.h) is a specialized `ParallelChannel` to add sub channels automatically based on tags defined in the naming service. As a result, users can list all machines in one naming service and partition them by tags. Check [example/partition_echo_c++](https://github.com/apache/brpc/tree/master/example/partition_echo_c++/) for an example.
 
-`ParititonChannel` only supports one kind to partitioning method. When multiple methods need to coexist, or one method needs to be changed to another smoothly, try `DynamicPartitionChannel`, which creates corresponding sub `PartitionChannel` for different partitioning methods, and divide traffic to partitions according to capacities of servers. Check [example/dynamic_partition_echo_c++](https://github.com/brpc/brpc/tree/master/example/dynamic_partition_echo_c++/) for an example.
+`ParititonChannel` only supports one kind to partitioning method. When multiple methods need to coexist, or one method needs to be changed to another smoothly, try `DynamicPartitionChannel`, which creates corresponding sub `PartitionChannel` for different partitioning methods, and divide traffic to partitions according to capacities of servers. Check [example/dynamic_partition_echo_c++](https://github.com/apache/brpc/tree/master/example/dynamic_partition_echo_c++/) for an example.
 
 If partitions are listed in different naming services, users have to implement the partitioning by `ParallelChannel` and include sub channels to corresponding naming services respectively. Refer to [the previous section](#ParallelChannel) for usages of `ParellelChannel`.
 

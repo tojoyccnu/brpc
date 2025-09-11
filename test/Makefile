@@ -18,15 +18,22 @@
 NEED_GPERFTOOLS=1
 NEED_GTEST=1
 include ../config.mk
-CPPFLAGS+=-DBTHREAD_USE_FAST_PTHREAD_MUTEX -D__const__= -D_GNU_SOURCE -DUSE_SYMBOLIZE -DNO_TCMALLOC -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -DUNIT_TEST -Dprivate=public -Dprotected=public -DBVAR_NOT_LINK_DEFAULT_VARIABLES --include sstream_workaround.h
-CXXFLAGS=$(CPPFLAGS) -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer -std=c++0x
+CPPFLAGS+=-DBTHREAD_USE_FAST_PTHREAD_MUTEX -D_GNU_SOURCE -DUSE_SYMBOLIZE -DNO_TCMALLOC -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -DUNIT_TEST -Dprivate=public -Dprotected=public -DBVAR_NOT_LINK_DEFAULT_VARIABLES --include sstream_workaround.h
+CXXFLAGS+=$(CPPFLAGS) -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer -std=c++0x
+
+# On Darwin, only gtest library is needed, other libraries have been linked in `brpc.dbg.dylib`
+ifeq ($(SYSTEM),Darwin)
+  GTEST_STATIC_LINKINGS := $(filter %libgtest.a %libgtest_main.a,$(STATIC_LINKINGS))
+endif
 
 #required by butil/crc32.cc to boost performance for 10x
 ifeq ($(shell test $(GCC_VERSION) -ge 40400; echo $$?),0)
-	CXXFLAGS+=-msse4 -msse4.2
+  ifeq ($(shell uname -p),i386)  #note: i386 is processor family type, not the 32-bit x86 arch
+    CXXFLAGS+=-msse4 -msse4.2
+  endif
 endif
-#not solved yet
 ifeq ($(CC),gcc)
+  # FIXME(jge): not solved yet
  ifeq ($(shell test $(GCC_VERSION) -ge 70000; echo $$?),0)
 	CXXFLAGS+=-Wno-aligned-new
  endif
@@ -48,6 +55,7 @@ TEST_BUTIL_SOURCES = \
     at_exit_unittest.cc \
     atomicops_unittest.cc \
     base64_unittest.cc \
+    base64url_unittest.cc \
     big_endian_unittest.cc \
     bits_unittest.cc \
     hash_tables_unittest.cc \
@@ -55,6 +63,7 @@ TEST_BUTIL_SOURCES = \
     mru_cache_unittest.cc \
     small_map_unittest.cc \
     stack_container_unittest.cc \
+    mpsc_queue_unittest.cc \
     cpu_unittest.cc \
     crash_logging_unittest.cc \
     leak_tracker_unittest.cc \
@@ -130,6 +139,7 @@ TEST_BUTIL_SOURCES = \
     synchronous_event_unittest.cpp \
     temp_file_unittest.cpp \
     baidu_thread_local_unittest.cpp \
+    thread_key_unittest.cpp \
     baidu_time_unittest.cpp \
     flat_map_unittest.cpp \
     crc32c_unittest.cc \
@@ -140,7 +150,9 @@ TEST_BUTIL_SOURCES = \
     scoped_locale.cc \
     popen_unittest.cpp \
     bounded_queue_unittest.cc \
-    butil_unittest_main.cpp
+    butil_unittest_main.cpp \
+    scope_guard_unittest.cpp \
+    optional_unittest.cpp
 
 ifeq ($(SYSTEM), Linux)
     TEST_BUTIL_SOURCES += test_file_util_linux.cc \
@@ -153,9 +165,11 @@ ifeq ($(SYSTEM), Darwin)
 	DYNAMIC_LINKINGS+=-Wl,-U,_bthread_getspecific
 	DYNAMIC_LINKINGS+=-Wl,-U,_bthread_setspecific
 	DYNAMIC_LINKINGS+=-Wl,-U,_bthread_key_create
+	DYNAMIC_LINKINGS+=-Wl,-U,_bthread_self
+	DYNAMIC_LINKINGS+=-Wl,-U,_bthread_timed_connect
 endif
 
-UT_DYNAMIC_LINKINGS = $(DYNAMIC_LINKINGS) -lbrpc.dbg
+UT_DYNAMIC_LINKINGS = -lbrpc.dbg $(DYNAMIC_LINKINGS)
 
 TEST_BUTIL_OBJS = iobuf.pb.o $(addsuffix .o, $(basename $(TEST_BUTIL_SOURCES))) 
 
@@ -189,7 +203,7 @@ clean_bins:
 libbrpc.dbg.$(SOEXT):FORCE
 	$(MAKE) -C.. test/libbrpc.dbg.$(SOEXT)
 
-libbvar.dbg.a:FORCE
+libbvar.dbg.a:libbrpc.dbg.$(SOEXT) FORCE
 	$(MAKE) -C.. test/libbvar.dbg.a
 
 FORCE:
@@ -201,7 +215,7 @@ test_butil:$(TEST_BUTIL_OBJS) | libbrpc.dbg.$(SOEXT)
 ifeq ($(SYSTEM),Linux)
 	$(CXX) -o $@ $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $^ -Xlinker "-)" $(STATIC_LINKINGS) $(UT_DYNAMIC_LINKINGS)
 else ifeq ($(SYSTEM),Darwin)
-	$(CXX) -o $@ $(LIBPATHS) $(SOPATHS) $^ $(STATIC_LINKINGS) $(UT_DYNAMIC_LINKINGS)
+	$(CXX) -o $@ $(LIBPATHS) $(SOPATHS) $^ $(GTEST_STATIC_LINKINGS) $(UT_DYNAMIC_LINKINGS)
 endif
 
 test_bvar:libbvar.dbg.a $(TEST_BVAR_OBJS)
@@ -217,7 +231,7 @@ bthread%unittest:bthread%unittest.o | libbrpc.dbg.$(SOEXT)
 ifeq ($(SYSTEM),Linux)
 	$(CXX) -o $@ $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $^ -Xlinker "-)" $(STATIC_LINKINGS) $(UT_DYNAMIC_LINKINGS)
 else ifeq ($(SYSTEM),Darwin)
-	$(CXX) -o $@ $(LIBPATHS) $(SOPATHS) $^ $(STATIC_LINKINGS) $(UT_DYNAMIC_LINKINGS)
+	$(CXX) -o $@ $(LIBPATHS) $(SOPATHS) $^ $(GTEST_STATIC_LINKINGS) $(UT_DYNAMIC_LINKINGS)
 endif
 
 brpc_%_unittest:$(TEST_PROTO_OBJS) brpc_%_unittest.o | libbrpc.dbg.$(SOEXT)
@@ -225,7 +239,7 @@ brpc_%_unittest:$(TEST_PROTO_OBJS) brpc_%_unittest.o | libbrpc.dbg.$(SOEXT)
 ifeq ($(SYSTEM),Linux)
 	$(CXX) -o $@ $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $^ -Xlinker "-)" $(STATIC_LINKINGS) $(UT_DYNAMIC_LINKINGS)
 else ifeq ($(SYSTEM),Darwin)
-	$(CXX) -o $@ $(LIBPATHS) $(SOPATHS) $^ $(STATIC_LINKINGS) $(UT_DYNAMIC_LINKINGS)
+	$(CXX) -o $@ $(LIBPATHS) $(SOPATHS) $^ $(GTEST_STATIC_LINKINGS) $(UT_DYNAMIC_LINKINGS)
 endif
 
 %.pb.cc %.pb.h:%.proto

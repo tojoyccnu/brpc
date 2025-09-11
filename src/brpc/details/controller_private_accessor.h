@@ -57,6 +57,10 @@ public:
         return _cntl->_current_call.sending_sock.get();
     }
 
+    int64_t real_timeout_ms() {
+        return _cntl->_real_timeout_ms;
+    }
+
     void move_in_server_receiving_sock(SocketUniquePtr& ptr) {
         CHECK(_cntl->_current_call.sending_sock == NULL);
         _cntl->_current_call.sending_sock.reset(ptr.release());
@@ -115,8 +119,8 @@ public:
         return _cntl->_remote_stream_settings;
     }
 
-    StreamId request_stream() { return _cntl->_request_stream; }
-    StreamId response_stream() { return _cntl->_response_stream; }
+    StreamIds request_streams() { return _cntl->_request_streams; }
+    StreamIds response_streams() { return _cntl->_response_streams; }
 
     void set_method(const google::protobuf::MethodDescriptor* method) 
     { _cntl->_method = method; }
@@ -124,13 +128,11 @@ public:
     void set_readable_progressive_attachment(ReadableProgressiveAttachment* s)
     { _cntl->_rpa.reset(s); }
 
-    void add_with_auth() {
-        _cntl->add_flag(Controller::FLAGS_REQUEST_WITH_AUTH);
+    void set_auth_flags(uint32_t auth_flags) {
+        _cntl->_auth_flags = auth_flags;
     }
 
-    void clear_with_auth() {
-        _cntl->clear_flag(Controller::FLAGS_REQUEST_WITH_AUTH);
-    }
+    void clear_auth_flags() { _cntl->_auth_flags = 0; }
 
     std::string& protocol_param() { return _cntl->protocol_param(); }
     const std::string& protocol_param() const { return _cntl->protocol_param(); }
@@ -149,6 +151,16 @@ public:
         _cntl->add_flag(Controller::FLAGS_HEALTH_CHECK_CALL);
         return *this;
     }
+
+    void set_checksum_value(const char* c, size_t size) {
+        _cntl->_checksum_value.assign(c, size);
+    }
+
+    void set_checksum_value(const std::string& c) {
+        _cntl->_checksum_value = c;
+    }
+
+    const std::string& checksum_value() const { return _cntl->_checksum_value; }
 
 private:
     Controller* _cntl;

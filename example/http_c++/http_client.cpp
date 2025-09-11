@@ -28,7 +28,7 @@
 
 DEFINE_string(d, "", "POST this data to the http server");
 DEFINE_string(load_balancer, "", "The algorithm for load balancing");
-DEFINE_int32(timeout_ms, 1000, "RPC timeout in milliseconds");
+DEFINE_int32(timeout_ms, 2000, "RPC timeout in milliseconds");
 DEFINE_int32(max_retry, 3, "Max retries(not including the first RPC)"); 
 DEFINE_string(protocol, "http", "Client-side protocol");
 
@@ -38,7 +38,7 @@ DECLARE_bool(http_verbose);
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     if (argc != 2) {
         LOG(ERROR) << "Usage: ./http_client \"http(s)://www.foo.com\"";

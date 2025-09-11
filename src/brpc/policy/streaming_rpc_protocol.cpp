@@ -43,7 +43,7 @@ void PackStreamMessage(butil::IOBuf* out,
                        const StreamFrameMeta &fm,
                        const butil::IOBuf *data) {
     const uint32_t data_length = data ? data->length() : 0;
-    const uint32_t meta_length = fm.ByteSize();
+    const uint32_t meta_length = GetProtobufByteSize(fm);
     char head[12];
     uint32_t* dummy = (uint32_t*)head;  // suppresses strict-alias warning
     *(uint32_t*)dummy = *(const uint32_t*)"STRM";
@@ -108,7 +108,9 @@ ParseResult ParseStreamingMessage(butil::IOBuf* source,
                             && fm.frame_type() != FRAME_TYPE_CLOSE
                             && fm.frame_type() != FRAME_TYPE_FEEDBACK)
                    << "Fail to find stream=" << fm.stream_id();
-            if (fm.has_source_stream_id()) {
+            // It's normal that the stream is closed before receiving feedback frames from peer.
+            // In this case, RST frame should not be sent to peer, otherwise on-fly data can be lost.
+            if (fm.has_source_stream_id() && fm.frame_type() != FRAME_TYPE_FEEDBACK) {
                 SendStreamRst(socket, fm.source_stream_id());
             }
             break;
@@ -132,7 +134,9 @@ void SendStreamRst(Socket *sock, int64_t remote_stream_id) {
     fm.set_frame_type(FRAME_TYPE_RST);
     butil::IOBuf out;
     PackStreamMessage(&out, fm, NULL);
-    sock->Write(&out);
+    Socket::WriteOptions wopt;
+    wopt.ignore_eovercrowded = true;
+    sock->Write(&out, &wopt);
 }
 
 void SendStreamClose(Socket *sock, int64_t remote_stream_id,
@@ -144,11 +148,15 @@ void SendStreamClose(Socket *sock, int64_t remote_stream_id,
     fm.set_frame_type(FRAME_TYPE_CLOSE);
     butil::IOBuf out;
     PackStreamMessage(&out, fm, NULL);
-    sock->Write(&out);
+    Socket::WriteOptions wopt;
+    wopt.ignore_eovercrowded = true;
+    sock->Write(&out, &wopt);
 }
 
 int SendStreamData(Socket* sock, const butil::IOBuf* data,
-                   int64_t remote_stream_id, int64_t source_stream_id) {
+                   int64_t remote_stream_id, int64_t source_stream_id,
+                   bthread_id_t response_id) {
+    CHECK(sock != NULL);
     StreamFrameMeta fm;
     fm.set_stream_id(remote_stream_id);
     fm.set_source_stream_id(source_stream_id);
@@ -156,7 +164,13 @@ int SendStreamData(Socket* sock, const butil::IOBuf* data,
     fm.set_has_continuation(false);
     butil::IOBuf out;
     PackStreamMessage(&out, fm, data);
-    return sock->Write(&out);
+    Socket::WriteOptions wopt;
+    if (INVALID_BTHREAD_ID != response_id) {
+        wopt.id_wait = response_id;
+        wopt.notify_on_success = true;
+    }
+    wopt.ignore_eovercrowded = true;
+    return sock->Write(&out, &wopt);
 }
 
 }  // namespace policy

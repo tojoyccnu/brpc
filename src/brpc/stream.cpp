@@ -35,6 +35,10 @@
 namespace brpc {
 
 DECLARE_bool(usercode_in_pthread);
+DECLARE_int64(socket_max_streams_unconsumed_bytes);
+DEFINE_uint64(stream_write_max_segment_size, 512 * 1024 * 1024,
+              "Stream message exceeding this size will be automatically split into smaller segments");
+BRPC_VALIDATE_GFLAG(stream_write_max_segment_size, PositiveInteger);
 
 const static butil::IOBuf *TIMEOUT_TASK = (butil::IOBuf*)-1L;
 
@@ -43,8 +47,10 @@ Stream::Stream()
     , _fake_socket_weak_ref(NULL)
     , _connected(false)
     , _closed(false)
+    , _error_code(0)
     , _produced(0)
     , _remote_consumed(0)
+    , _cur_buf_size(0)
     , _local_consumed(0)
     , _parse_rpc_response(false)
     , _pending_buf(NULL)
@@ -57,6 +63,11 @@ Stream::Stream()
 }
 
 Stream::~Stream() {
+    // Clear pending buffer
+    if (_pending_buf != NULL) {
+        delete _pending_buf;
+        _pending_buf = NULL;
+    }
     CHECK(_host_socket == NULL);
     bthread_mutex_destroy(&_connect_mutex);
     bthread_mutex_destroy(&_congestion_control_mutex);
@@ -65,19 +76,28 @@ Stream::~Stream() {
 
 int Stream::Create(const StreamOptions &options, 
                    const StreamSettings *remote_settings,
-                   StreamId *id) {
+                   StreamId *id, bool parse_rpc_response) {
     Stream* s = new Stream();
     s->_host_socket = NULL;
     s->_fake_socket_weak_ref = NULL;
     s->_connected = false;
     s->_options = options;
     s->_closed = false;
+    s->_error_code = 0;
+    s->_cur_buf_size = options.max_buf_size > 0 ? options.max_buf_size : 0;
+    if (options.max_buf_size > 0 && options.min_buf_size > options.max_buf_size) {
+        // set 0 if min_buf_size is invalid.
+        s->_options.min_buf_size = 0;
+        LOG(WARNING) << "options.min_buf_size is larger than options.max_buf_size, it will be set to 0.";
+    }
+    if (FLAGS_socket_max_streams_unconsumed_bytes > 0 && s->_options.min_buf_size > 0) {
+        s->_cur_buf_size = s->_options.min_buf_size;
+    }
+
     if (remote_settings != NULL) {
         s->_remote_settings.MergeFrom(*remote_settings);
-        s->_parse_rpc_response = false;
-    } else {
-        s->_parse_rpc_response = true;
     }
+    s->_parse_rpc_response = parse_rpc_response;
     if (bthread_id_list_init(&s->_writable_wait_list, 8, 8/*FIXME*/)) {
         delete s;
         return -1;
@@ -119,7 +139,7 @@ void Stream::BeforeRecycle(Socket *) {
     if (_host_socket) {
         _host_socket->RemoveStream(id());
     }
-    
+
     // The instance is to be deleted in the consumer thread
     bthread::execution_queue_stop(_consumer_queue);
 }
@@ -142,18 +162,54 @@ ssize_t Stream::CutMessageIntoFileDescriptor(int /*fd*/,
     }
     butil::IOBuf out;
     ssize_t len = 0;
+    ssize_t unwritten_data_size = 0;
     for (size_t i = 0; i < size; ++i) {
-        StreamFrameMeta fm;
-        fm.set_stream_id(_remote_settings.stream_id());
-        fm.set_source_stream_id(id());
-        fm.set_frame_type(FRAME_TYPE_DATA);
-        // TODO: split large data
-        fm.set_has_continuation(false);
-        policy::PackStreamMessage(&out, fm, data_list[i]);
-        len += data_list[i]->length();
-        data_list[i]->clear();
+        butil::IOBuf *data = data_list[i];
+        size_t length = data->length();
+        if (length > FLAGS_stream_write_max_segment_size) {
+            if (unwritten_data_size) {
+                WriteToHostSocket(&out);
+                unwritten_data_size = 0;
+                out.clear();
+            }
+            // segmenting large data into multiple parts
+            butil::IOBuf segment_buf;
+            bool has_continuation = true;
+            while (has_continuation) {
+                data->cutn(&segment_buf, FLAGS_stream_write_max_segment_size);
+                StreamFrameMeta fm;
+                fm.set_stream_id(_remote_settings.stream_id());
+                fm.set_source_stream_id(id());
+                fm.set_frame_type(FRAME_TYPE_DATA);
+                has_continuation = !data->empty();
+                fm.set_has_continuation(has_continuation);
+                policy::PackStreamMessage(&out, fm, &segment_buf);
+                len += segment_buf.length();
+                segment_buf.clear();
+                WriteToHostSocket(&out);
+                out.clear();
+            }
+        } else {
+            if (unwritten_data_size + length > FLAGS_stream_write_max_segment_size) {
+                WriteToHostSocket(&out);
+                unwritten_data_size = 0;
+                out.clear();
+            }
+            unwritten_data_size += length;
+            StreamFrameMeta fm;
+            fm.set_stream_id(_remote_settings.stream_id());
+            fm.set_source_stream_id(id());
+            fm.set_frame_type(FRAME_TYPE_DATA);
+            fm.set_has_continuation(false);
+            policy::PackStreamMessage(&out, fm, data_list[i]);
+            len += length;
+            data_list[i]->clear();
+        }
     }
-    WriteToHostSocket(&out);
+
+    if (!out.empty()) {
+        WriteToHostSocket(&out);
+    }
     return len;
 }
 
@@ -259,10 +315,11 @@ void Stream::TriggerOnConnectIfNeed() {
     bthread_mutex_unlock(&_connect_mutex);
 }
 
-int Stream::AppendIfNotFull(const butil::IOBuf &data) {
-    if (_options.max_buf_size > 0) {
+int Stream::AppendIfNotFull(const butil::IOBuf &data,
+                            const StreamWriteOptions* options) {
+    if (_cur_buf_size > 0) {
         std::unique_lock<bthread_mutex_t> lck(_congestion_control_mutex);
-        if (_produced >= _remote_consumed + (size_t)_options.max_buf_size) {
+        if (_produced >= _remote_consumed + _cur_buf_size) {
             const size_t saved_produced = _produced;
             const size_t saved_remote_consumed = _remote_consumed;
             lck.unlock();
@@ -270,25 +327,32 @@ int Stream::AppendIfNotFull(const butil::IOBuf &data) {
                      << "_produced=" << saved_produced
                      << " _remote_consumed=" << saved_remote_consumed
                      << " gap=" << saved_produced - saved_remote_consumed
-                     << " max_buf_size=" << _options.max_buf_size;
+                     << " max_buf_size=" << _cur_buf_size;
             return 1;
         }
         _produced += data.length();
     }
+
+    size_t data_length = data.length();
     butil::IOBuf copied_data(data);
-    const int rc = _fake_socket_weak_ref->Write(&copied_data);
+    Socket::WriteOptions wopt;
+    wopt.write_in_background = options != NULL && options->write_in_background;
+    const int rc = _fake_socket_weak_ref->Write(&copied_data, &wopt);
     if (rc != 0) {
         // Stream may be closed by peer before
         LOG(WARNING) << "Fail to write to _fake_socket, " << berror();
         BAIDU_SCOPED_LOCK(_congestion_control_mutex);
-        _produced -= data.length();
+        _produced -= data_length;
         return -1;
+    }
+    if (FLAGS_socket_max_streams_unconsumed_bytes > 0) {
+        _host_socket->_total_streams_unconsumed_size += data_length;
     }
     return 0;
 }
 
 void Stream::SetRemoteConsumed(size_t new_remote_consumed) {
-    CHECK(_options.max_buf_size > 0);
+    CHECK(_cur_buf_size > 0);
     bthread_id_list_t tmplist;
     bthread_id_list_init(&tmplist, 0, 0);
     bthread_mutex_lock(&_congestion_control_mutex);
@@ -296,9 +360,28 @@ void Stream::SetRemoteConsumed(size_t new_remote_consumed) {
         bthread_mutex_unlock(&_congestion_control_mutex);
         return;
     }
-    const bool was_full = _produced >= _remote_consumed + (size_t)_options.max_buf_size;
+    const bool was_full = _produced >= _remote_consumed + _cur_buf_size;
+
+    if (FLAGS_socket_max_streams_unconsumed_bytes > 0) {
+        _host_socket->_total_streams_unconsumed_size -= new_remote_consumed - _remote_consumed;
+        if (_host_socket->_total_streams_unconsumed_size > FLAGS_socket_max_streams_unconsumed_bytes) {
+            if (_options.min_buf_size > 0) {
+                _cur_buf_size = _options.min_buf_size;
+            } else {
+                _cur_buf_size /= 2;
+            }
+            LOG(INFO) << "stream consumers on socket " << _host_socket->id() << " is crowded, " <<  "cut stream " << id() << " buffer to " << _cur_buf_size;
+        } else if (_produced >= new_remote_consumed + _cur_buf_size && (_options.max_buf_size <= 0 || _cur_buf_size < (size_t)_options.max_buf_size)) {
+            if (_options.max_buf_size > 0 && _cur_buf_size * 2 > (size_t)_options.max_buf_size) {
+                _cur_buf_size = _options.max_buf_size;
+            } else {
+                _cur_buf_size *= 2;
+            }
+        }
+    }
+
     _remote_consumed = new_remote_consumed;
-    const bool is_full = _produced >= _remote_consumed + (size_t)_options.max_buf_size;
+    const bool is_full = _produced >= _remote_consumed + _cur_buf_size;
     if (was_full && !is_full) {
         bthread_id_list_swap(&tmplist, &_writable_wait_list);
     }
@@ -374,8 +457,8 @@ void Stream::Wait(void (*on_writable)(StreamId, void*, int), void* arg,
         }
     }
     bthread_mutex_lock(&_congestion_control_mutex);
-    if (_options.max_buf_size <= 0 
-            || _produced < _remote_consumed + (size_t)_options.max_buf_size) {
+    if (_cur_buf_size <= 0 
+            || _produced < _remote_consumed + _cur_buf_size) {
         bthread_mutex_unlock(&_congestion_control_mutex);
         CHECK_EQ(0, TriggerOnWritable(wait_id, wm, 0));
         return;
@@ -427,21 +510,22 @@ int Stream::OnReceived(const StreamFrameMeta& fm, butil::IOBuf *buf, Socket* soc
         if (!fm.has_continuation()) {
             butil::IOBuf *tmp = _pending_buf;
             _pending_buf = NULL;
-            if (bthread::execution_queue_execute(_consumer_queue, tmp) != 0) {
+            int rc = bthread::execution_queue_execute(_consumer_queue, tmp);
+            if (rc != 0) {
                 CHECK(false) << "Fail to push into channel";
                 delete tmp;
-                Close();
+                Close(rc, "Fail to push into channel");
             }
         }
         break;
     case FRAME_TYPE_RST:
-        RPC_VLOG << "stream=" << id() << " recevied rst frame";
-        Close();
+        RPC_VLOG << "stream=" << id() << " received rst frame";
+        Close(ECONNRESET, "Received RST frame");
         break;
     case FRAME_TYPE_CLOSE:
-        RPC_VLOG << "stream=" << id() << " recevied close frame";
+        RPC_VLOG << "stream=" << id() << " received close frame";
         // TODO:: See the comments in Consume
-        Close();
+        Close(0, "Received CLOSE frame");
         break;
     case FRAME_TYPE_UNKNOWN:
         RPC_VLOG << "Received unknown frame";
@@ -478,7 +562,7 @@ public:
         _total_length += buf->length();
 
     }
-    size_t total_length() { return _total_length; }
+    size_t total_length() const { return _total_length; }
 private:
     butil::IOBuf** _storage;
     size_t _cap;
@@ -491,15 +575,26 @@ int Stream::Consume(void *meta, bthread::TaskIterator<butil::IOBuf*>& iter) {
     Stream* s = (Stream*)meta;
     s->StopIdleTimer();
     if (iter.is_queue_stopped()) {
-        // indicating the queue was closed
+        scoped_ptr<Stream> recycled_stream(s);
+        // Indicating the queue was closed.
         if (s->_host_socket) {
             DereferenceSocket(s->_host_socket);
             s->_host_socket = NULL;
         }
         if (s->_options.handler != NULL) {
+            int error_code;
+            std::string error_text;
+            {
+                BAIDU_SCOPED_LOCK(s->_connect_mutex);
+                error_code = s->_error_code;
+                error_text = s->_error_text;
+            }
+            if (error_code != 0) {
+                // The stream is closed abnormally.
+                s->_options.handler->on_failed(s->id(), error_code, error_text);
+            }
             s->_options.handler->on_closed(s->id());
         }
-        delete s;
         return 0;
     }
     DEFINE_SMALL_ARRAY(butil::IOBuf*, buf_list, s->_options.messages_in_batch, 256);
@@ -524,6 +619,7 @@ int Stream::Consume(void *meta, bthread::TaskIterator<butil::IOBuf*>& iter) {
         }
     }
     mb.flush();
+
     if (s->_remote_settings.need_feedback() && mb.total_length() > 0) {
         s->_local_consumed += mb.total_length();
         s->SendFeedback();
@@ -544,23 +640,22 @@ void Stream::SendFeedback() {
 }
 
 int Stream::SetHostSocket(Socket *host_socket) {
-    if (_host_socket != NULL) {
-        CHECK(false) << "SetHostSocket has already been called";
-        return -1;
-    }
-    SocketUniquePtr ptr;
-    host_socket->ReAddress(&ptr);
-    // TODO add *this to host socke
-    if (ptr->AddStream(id()) != 0) {
-        return -1;
-    }
-    _host_socket = ptr.release();
+    std::call_once(_set_host_socket_flag, [this, host_socket]() {
+        SocketUniquePtr ptr;
+        host_socket->ReAddress(&ptr);
+        // TODO add *this to host socke
+        if (ptr->AddStream(id()) != 0) {
+            CHECK(false) << id() << " fail to add stream to host socket";
+            return;
+        }
+        _host_socket = ptr.release();
+    });
     return 0;
 }
 
 void Stream::FillSettings(StreamSettings *settings) {
     settings->set_stream_id(id());
-    settings->set_need_feedback(_options.max_buf_size > 0);
+    settings->set_need_feedback(_cur_buf_size > 0);
     settings->set_writable(_options.handler != NULL);
 }
 
@@ -590,7 +685,7 @@ void Stream::StopIdleTimer() {
     }
 }
 
-void Stream::Close() {
+void Stream::Close(int error_code, const char* reason_fmt, ...) {
     _fake_socket_weak_ref->SetFailed();
     bthread_mutex_lock(&_connect_mutex);
     if (_closed) {
@@ -598,6 +693,13 @@ void Stream::Close() {
         return;
     }
     _closed = true;
+    _error_code = error_code;
+
+    va_list ap;
+    va_start(ap, reason_fmt);
+    butil::string_vappendf(&_error_text, reason_fmt, ap);
+    va_end(ap);
+
     if (_connected) {
         bthread_mutex_unlock(&_connect_mutex);
         return;
@@ -607,14 +709,27 @@ void Stream::Close() {
     return TriggerOnConnectIfNeed();
 }
 
-int Stream::SetFailed(StreamId id) {
+int Stream::SetFailed(StreamId id, int error_code, const char* reason_fmt, ...) {
     SocketUniquePtr ptr;
     if (Socket::AddressFailedAsWell(id, &ptr) == -1) {
         // Don't care recycled stream
         return 0;
     }
     Stream* s = (Stream*)ptr->conn();
-    s->Close();
+    va_list ap;
+    va_start(ap, reason_fmt);
+    s->Close(error_code, reason_fmt, ap);
+    va_end(ap);
+    return 0;
+}
+
+int Stream::SetFailed(const StreamIds& ids, int error_code, const char* reason_fmt, ...) {
+    va_list ap;
+    va_start(ap, reason_fmt);
+    for(size_t i = 0; i< ids.size(); ++i) {
+        Stream::SetFailed(ids[i], error_code, reason_fmt, ap);
+    }
+    va_end(ap);
     return 0;
 }
 
@@ -625,13 +740,13 @@ void Stream::HandleRpcResponse(butil::IOBuf* response_buffer) {
     ParseResult pr = policy::ParseRpcMessage(response_buffer, NULL, true, NULL);
     if (!pr.is_ok()) {
         CHECK(false);
-        Close();
+        Close(EPROTO, "Fail to parse rpc response message");
         return;
     }
     InputMessageBase* msg = pr.message();
     if (msg == NULL) {
         CHECK(false);
-        Close();
+        Close(ENOMEM, "Message is NULL");
         return;
     }
     _host_socket->PostponeEOF();
@@ -642,13 +757,14 @@ void Stream::HandleRpcResponse(butil::IOBuf* response_buffer) {
     policy::ProcessRpcResponse(msg);
 }
 
-int StreamWrite(StreamId stream_id, const butil::IOBuf &message) {
+int StreamWrite(StreamId stream_id, const butil::IOBuf &message,
+                const StreamWriteOptions* options) {
     SocketUniquePtr ptr;
     if (Socket::Address(stream_id, &ptr) != 0) {
         return EINVAL;
     }
     Stream* s = (Stream*)ptr->conn();
-    const int rc = s->AppendIfNotFull(message);
+    const int rc = s->AppendIfNotFull(message, options);
     if (rc == 0) {
         return 0;
     }
@@ -689,42 +805,81 @@ int StreamWait(StreamId stream_id, const timespec* due_time) {
 }
 
 int StreamClose(StreamId stream_id) {
-    return Stream::SetFailed(stream_id);
+    return Stream::SetFailed(stream_id, 0, "Local close");
 }
 
 int StreamCreate(StreamId *request_stream, Controller &cntl,
                  const StreamOptions* options) {
-    if (cntl._request_stream != INVALID_STREAM_ID) {
-        LOG(ERROR) << "Can't create request stream more than once";
-        return -1;
-    }
     if (request_stream == NULL) {
         LOG(ERROR) << "request_stream is NULL";
         return -1;
     }
-    StreamId stream_id;
+    StreamIds request_streams;
+    StreamCreate(request_streams, 1, cntl, options);
+    *request_stream = request_streams[0];
+    return 0;
+}
+
+int StreamCreate(StreamIds& request_streams, int request_stream_size, Controller & cntl,
+                 const StreamOptions* options) {
+    if (!cntl._request_streams.empty()) {
+        LOG(ERROR) << "Can't create request stream more than once";
+        return -1;
+    }
+    if (!request_streams.empty()) {
+        LOG(ERROR) << "request_streams should be empty";
+        return -1;
+    }
     StreamOptions opt;
     if (options != NULL) {
         opt = *options;
     }
-    if (Stream::Create(opt, NULL, &stream_id) != 0) {
-        LOG(ERROR) << "Fail to create stream";
-        return -1;
+    for (auto i = 0; i < request_stream_size; ++i) {
+        StreamId stream_id;
+        bool parse_rpc_response = (i == 0); // Only the first stream need parse rpc
+        if (Stream::Create(opt, NULL, &stream_id, parse_rpc_response) != 0) {
+            // Close already created streams
+            Stream::SetFailed(request_streams, 0 , "Fail to create stream at %d index", i);
+            LOG(ERROR) << "Fail to create stream";
+            return -1;
+        }
+        cntl._request_streams.push_back(stream_id);
+        request_streams.push_back(stream_id);
     }
-    cntl._request_stream = stream_id;
-    *request_stream = stream_id;
     return 0;
 }
 
 int StreamAccept(StreamId* response_stream, Controller &cntl,
                  const StreamOptions* options) {
-
-    if (cntl._response_stream != INVALID_STREAM_ID) {
-        LOG(ERROR) << "Can't create reponse stream more than once";
-        return -1;
-    }
     if (response_stream == NULL) {
         LOG(ERROR) << "response_stream is NULL";
+        return -1;
+    }
+    StreamIds response_streams;
+    int res = StreamAccept(response_streams, cntl, options);
+    if(res != 0) {
+        return res;
+    }
+    if(response_streams.size() != 1) {
+        Stream::SetFailed(response_streams, EINVAL,
+                          "misusing StreamAccept for single stream to accept multiple streams");
+        cntl._response_streams.clear();
+        LOG(ERROR) << "misusing StreamAccept for single stream to accept multiple streams";
+        return -1;
+    }
+    *response_stream = response_streams[0];
+    return 0;
+}
+
+int StreamAccept(StreamIds& response_streams, Controller& cntl,
+                 const StreamOptions* options) {
+    if (!cntl._response_streams.empty()) {
+        LOG(ERROR) << "Can't create response stream more than once";
+        return -1;
+    }
+
+    if (!response_streams.empty()) {
+        LOG(ERROR) << "response_streams should be empty";
         return -1;
     }
     if (!cntl.has_remote_stream()) {
@@ -736,12 +891,34 @@ int StreamAccept(StreamId* response_stream, Controller &cntl,
         opt = *options;
     }
     StreamId stream_id;
-    if (Stream::Create(opt, cntl._remote_stream_settings, &stream_id) != 0) {
-        LOG(ERROR) << "Fail to create stream";
+    if (Stream::Create(opt, cntl._remote_stream_settings, &stream_id, false) != 0) {
+        Stream::SetFailed(response_streams, 0, "Fail to accept stream");
+        LOG(ERROR) << "Fail to accept stream";
         return -1;
     }
-    cntl._response_stream = stream_id;
-    *response_stream = stream_id;
+
+    cntl._response_streams.push_back(stream_id);
+    response_streams.push_back(stream_id);
+    if(!cntl._remote_stream_settings->extra_stream_ids().empty()) {
+        StreamSettings stream_remote_settings;
+        stream_remote_settings.MergeFrom(*cntl._remote_stream_settings);
+        //Only the first stream needs extra_stream_ids settings
+        stream_remote_settings.clear_extra_stream_ids();
+        for (auto i = 0; i < cntl._remote_stream_settings->extra_stream_ids_size(); ++i) {
+            stream_remote_settings.set_stream_id(cntl._remote_stream_settings->extra_stream_ids()[i]);
+            StreamId extra_stream_id;
+            if (Stream::Create(opt, &stream_remote_settings, &extra_stream_id, false) != 0) {
+                Stream::SetFailed(response_streams, 0, "Fail to accept stream at %d index", i);
+                cntl._response_streams.clear();
+                response_streams.clear();
+                LOG(ERROR) << "Fail to accept stream";
+                return -1;
+            }
+            cntl._response_streams.push_back(extra_stream_id);
+            response_streams.push_back(extra_stream_id);
+        }
+    }
+
     return 0;
 }
 

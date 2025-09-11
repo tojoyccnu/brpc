@@ -60,7 +60,7 @@ class TrackMeServiceImpl : public brpc::TrackMeService {
 public:
     explicit TrackMeServiceImpl(BugsLoader* bugs) : _bugs(bugs) {
     }
-    ~TrackMeServiceImpl() {};
+    ~TrackMeServiceImpl() {}
     void TrackMe(google::protobuf::RpcController* cntl_base,
                  const brpc::TrackMeRequest* request,
                  brpc::TrackMeResponse* response,
@@ -88,7 +88,7 @@ private:
 };
 
 int main(int argc, char* argv[]) {
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     
     brpc::Server server;
     server.set_version("trackme_server");

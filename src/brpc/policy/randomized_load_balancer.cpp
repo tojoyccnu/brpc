@@ -18,20 +18,13 @@
 
 #include "butil/macros.h"
 #include "butil/fast_rand.h"
+#include "bthread/prime_offset.h"
 #include "brpc/socket.h"
 #include "brpc/policy/randomized_load_balancer.h"
 #include "butil/strings/string_number_conversions.h"
 
 namespace brpc {
 namespace policy {
-
-const uint32_t prime_offset[] = {
-#include "bthread/offset_inl.list"
-};
-
-inline uint32_t GenRandomStride() {
-    return prime_offset[butil::fast_rand_less_than(ARRAY_SIZE(prime_offset))];
-}
 
 bool RandomizedLoadBalancer::Add(Servers& bg, const ServerId& id) {
     if (bg.server_list.capacity() < 128) {
@@ -97,9 +90,6 @@ size_t RandomizedLoadBalancer::AddServersInBatch(
 size_t RandomizedLoadBalancer::RemoveServersInBatch(
     const std::vector<ServerId>& servers) {
     const size_t n = _db_servers.Modify(BatchRemove, servers);
-    LOG_IF(ERROR, n != servers.size())
-        << "Fail to RemoveServersInBatch, expected " << servers.size()
-        << " actually " << n;
     return n;
 }
 
@@ -129,7 +119,7 @@ int RandomizedLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
             return 0;
         }
         if (stride == 0) {
-            stride = GenRandomStride();
+            stride = bthread::prime_offset();
         }
         // If `Address' failed, use `offset+stride' to retry so that
         // this failed server won't be visited again inside for

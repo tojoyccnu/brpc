@@ -38,8 +38,8 @@ brpc::Channel channel;
 namespace example {
 class CascadeEchoService : public EchoService {
 public:
-    CascadeEchoService() {};
-    virtual ~CascadeEchoService() {};
+    CascadeEchoService() {}
+    virtual ~CascadeEchoService() {}
     virtual void Echo(google::protobuf::RpcController* cntl_base,
                       const EchoRequest* request,
                       EchoResponse* response,
@@ -52,27 +52,25 @@ public:
             static_cast<brpc::Controller*>(cntl_base);
 
         if (request->depth() > 0) {
-            TRACEPRINTF("I'm about to call myself for another time, depth=%d",
-                        request->depth());
+            CLOGI(cntl) << "I'm about to call myself for another time, depth=" << request->depth();
             example::EchoService_Stub stub(&channel);
             example::EchoRequest request2;
             example::EchoResponse response2;
-            brpc::Controller cntl2;
+            brpc::Controller cntl2(cntl->inheritable());
             request2.set_message(request->message());
             request2.set_depth(request->depth() - 1);
 
-            cntl2.set_log_id(cntl->log_id());
             cntl2.set_timeout_ms(FLAGS_timeout_ms);
             cntl2.set_max_retry(FLAGS_max_retry);
             stub.Echo(&cntl2, &request2, &response2, NULL);
             if (cntl2.Failed()) {
-                LOG(ERROR) << "Fail to send EchoRequest, " << cntl2.ErrorText();
+                CLOGE(&cntl2) << "Fail to send EchoRequest, " << cntl2.ErrorText();
                 cntl->SetFailed(cntl2.ErrorCode(), "%s", cntl2.ErrorText().c_str());
                 return;
             }
             response->set_message(response2.message());
         } else {
-            TRACEPRINTF("I'm the last call");
+            CLOGI(cntl) << "I'm the last call";
             response->set_message(request->message());
         }
         
@@ -87,8 +85,8 @@ public:
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::SetUsageMessage("A server that may call itself");
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::SetUsageMessage("A server that may call itself");
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     // A Channel represents a communication line to a Server. Notice that 
     // Channel is thread-safe and can be shared by all threads in your program.

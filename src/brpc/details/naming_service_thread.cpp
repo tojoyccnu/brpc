@@ -80,13 +80,13 @@ NamingServiceThread::Actions::~Actions() {
 void NamingServiceThread::Actions::AddServers(
     const std::vector<ServerNode>&) {
     // FIXME(gejun)
-    abort();
+    RELEASE_ASSERT_VERBOSE(false, "Not implemented");
 }
 
 void NamingServiceThread::Actions::RemoveServers(
     const std::vector<ServerNode>&) {
     // FIXME(gejun)
-    abort();
+    RELEASE_ASSERT_VERBOSE(false, "Not implemented");
 }
 
 void NamingServiceThread::Actions::ResetServers(
@@ -125,7 +125,8 @@ void NamingServiceThread::Actions::ResetServers(
         //       Socket. SocketMapKey may be passed through AddWatcher. Make sure
         //       to pick those Sockets with the right settings during OnAddedServers
         const SocketMapKey key(_added[i], _owner->_options.channel_signature);
-        CHECK_EQ(0, SocketMapInsert(key, &tagged_id.id, _owner->_options.ssl_ctx));
+        CHECK_EQ(0, SocketMapInsert(key, &tagged_id.id, _owner->_options.ssl_ctx,
+                                    _owner->_options.use_rdma, _owner->_options.hc_option));
         _added_sockets.push_back(tagged_id);
     }
 
@@ -292,7 +293,7 @@ int NamingServiceThread::Start(NamingService* naming_service,
         int rc = bthread_start_urgent(&_tid, NULL, RunThis, this);
         if (rc) {
             LOG(ERROR) << "Fail to create bthread: " << berror(rc);
-            return -1;
+            return rc;
         }
     }
     return WaitForFirstBatchOfServers();
@@ -312,6 +313,10 @@ int NamingServiceThread::WaitForFirstBatchOfServers() {
         return -1;
     }
     return 0;
+}
+
+void NamingServiceThread::EndWait(int error_code) {
+    _actions.EndWait(error_code);
 }
 
 void NamingServiceThread::ServerNodeWithId2ServerId(
@@ -337,7 +342,7 @@ int NamingServiceThread::AddWatcher(NamingServiceWatcher* watcher,
         return -1;
     }
     BAIDU_SCOPED_LOCK(_mutex);
-    if (_watchers.insert(std::make_pair(watcher, filter)).second) {
+    if (_watchers.emplace(watcher, filter).second) {
         if (!_last_sockets.empty()) {
             std::vector<ServerId> added_ids;
             ServerNodeWithId2ServerId(_last_sockets, &added_ids, filter);
@@ -436,16 +441,14 @@ int GetNamingServiceThread(
                 return -1;
             }
             if (g_nsthread_map->init(64) != 0) {
-                mu.unlock();
-                LOG(ERROR) << "Fail to init g_nsthread_map";
-                return -1;
+                LOG(WARNING) << "Fail to init g_nsthread_map";
             }
         }
         NamingServiceThread*& ptr = (*g_nsthread_map)[key];
         if (ptr != NULL) {
             if (ptr->AddRefManually() == 0) {
                 // The ns thread's last intrusive_ptr was just destructed and
-                // the removal-from-global-map-code in ptr->~NamingServideThread()
+                // the removal-from-global-map-code in ptr->~NamingServiceThread()
                 // is about to run or already running, need to create another ns
                 // thread.
                 // Notice that we don't need to remove the reference because
@@ -468,8 +471,11 @@ int GetNamingServiceThread(
         }
     }
     if (new_thread) {
-        if (nsthread->Start(source_ns->New(), key.protocol, key.service_name, options) != 0) {
+        int rc = nsthread->Start(source_ns->New(), key.protocol, key.service_name, options);
+        if (rc != 0) {
             LOG(ERROR) << "Fail to start NamingServiceThread";
+            // Wake up those waiting for first batch of servers.
+            nsthread->EndWait(rc);
             std::unique_lock<pthread_mutex_t> mu(g_nsthread_map_mutex);
             g_nsthread_map->erase(key);
             return -1;

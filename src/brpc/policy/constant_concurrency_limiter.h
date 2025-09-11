@@ -27,11 +27,13 @@ class ConstantConcurrencyLimiter : public ConcurrencyLimiter {
 public:
     explicit ConstantConcurrencyLimiter(int max_concurrency);
     
-    bool OnRequested(int current_concurrency) override;
+    bool OnRequested(int current_concurrency, Controller*) override;
     
     void OnResponded(int error_code, int64_t latency_us) override;
 
     int MaxConcurrency() override;
+
+    int ResetMaxConcurrency(const AdaptiveMaxConcurrency&) override;
 
     ConstantConcurrencyLimiter* New(const AdaptiveMaxConcurrency&) const override;
 

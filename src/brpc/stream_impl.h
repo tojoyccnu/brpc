@@ -19,6 +19,7 @@
 #ifndef  BRPC_STREAM_IMPL_H
 #define  BRPC_STREAM_IMPL_H
 
+#include <mutex>
 #include "bthread/bthread.h"
 #include "bthread/execution_queue.h"
 #include "brpc/socket.h"
@@ -42,10 +43,11 @@ public:
 
     // --------------------- SocketConnection --------------
 
-    int AppendIfNotFull(const butil::IOBuf& msg);
+    int AppendIfNotFull(const butil::IOBuf& msg,
+                        const StreamWriteOptions* options = NULL);
     static int Create(const StreamOptions& options,
                       const StreamSettings *remote_settings,
-                      StreamId *id);
+                      StreamId *id, bool parse_rpc_response = true);
     StreamId id() { return _id; }
 
     int OnReceived(const StreamFrameMeta& fm, butil::IOBuf *buf, Socket* sock);
@@ -60,13 +62,18 @@ public:
                     const timespec *due_time);
     int Wait(const timespec* due_time);
     void FillSettings(StreamSettings *settings);
-    static int SetFailed(StreamId id);
-    void Close();
+    static int SetFailed(StreamId id, int error_code, const char* reason_fmt, ...)
+        __attribute__ ((__format__ (__printf__, 3, 4)));
+    static int SetFailed(const StreamIds& ids, int error_code, const char* reason_fmt, ...)
+    __attribute__ ((__format__ (__printf__, 3, 4)));
+    void Close(int error_code, const char* reason_fmt, ...)
+        __attribute__ ((__format__ (__printf__, 3, 4)));
 
 private:
 friend void StreamWait(StreamId stream_id, const timespec *due_time,
-                void (*on_writable)(StreamId, void*, int), void *arg);
+                       void (*on_writable)(StreamId, void*, int), void *arg);
 friend class MessageBatcher;
+friend struct butil::DefaultDeleter<Stream>;
     Stream();
     ~Stream();
     int Init(const StreamOptions options);
@@ -110,10 +117,13 @@ friend class MessageBatcher;
     ConnectMeta         _connect_meta;
     bool                _connected;
     bool                _closed;
+    int                 _error_code;
+    std::string         _error_text;
     
     bthread_mutex_t _congestion_control_mutex;
     size_t _produced;
     size_t _remote_consumed;
+    size_t _cur_buf_size;
     bthread_id_list_t _writable_wait_list;
 
     int64_t _local_consumed;
@@ -124,6 +134,7 @@ friend class MessageBatcher;
     butil::IOBuf *_pending_buf;
     int64_t _start_idle_timer_us;
     bthread_timer_t _idle_timer;
+    std::once_flag _set_host_socket_flag;
 };
 
 } // namespace brpc

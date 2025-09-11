@@ -58,8 +58,8 @@ uint64_t GetStride(const uint64_t weight_sum, const size_t num) {
       return 1;
     }
     uint32_t average_weight = weight_sum / num;
-    auto iter = std::lower_bound(prime_stride.begin(), prime_stride.end(),
-                                 average_weight);
+    auto iter = std::lower_bound(
+        prime_stride.begin(), prime_stride.end(), average_weight);
     while (iter != prime_stride.end()
            && !IsCoprime(weight_sum, *iter)) {
         ++iter;
@@ -78,17 +78,22 @@ bool WeightedRoundRobinLoadBalancer::Add(Servers& bg, const ServerId& id) {
         bg.server_list.reserve(128);
     }
     uint32_t weight = 0;
-    if (butil::StringToUint(id.tag, &weight) &&
-        weight > 0) {
-        bool insert_server =
-                 bg.server_map.emplace(id.id, bg.server_list.size()).second;
-        if (insert_server) {
-            bg.server_list.emplace_back(id.id, weight);
-            bg.weight_sum += weight;
-            return true;
+    if (!butil::StringToUint(id.tag, &weight) || weight <= 0) {
+        if (FLAGS_default_weight_of_wlb > 0) {
+            LOG(WARNING) << "Invalid weight is set: " << id.tag
+                         << ". Now, 'weight' has been set to 'FLAGS_default_weight_of_wlb' by default.";
+            weight = FLAGS_default_weight_of_wlb;
+        } else {
+            LOG(ERROR) << "Invalid weight is set: " << id.tag;
+            return false;
         }
-    } else {
-        LOG(ERROR) << "Invalid weight is set: " << id.tag;
+    }
+    bool insert_server =
+             bg.server_map.emplace(id.id, bg.server_list.size()).second;
+    if (insert_server) {
+        bg.server_list.emplace_back(id.id, weight);
+        bg.weight_sum += weight;
+        return true;
     }
     return false;
 }
@@ -145,9 +150,6 @@ size_t WeightedRoundRobinLoadBalancer::AddServersInBatch(
 size_t WeightedRoundRobinLoadBalancer::RemoveServersInBatch(
     const std::vector<ServerId>& servers) {
     const size_t n = _db_servers.Modify(BatchRemove, servers);
-    LOG_IF(ERROR, n != servers.size())
-        << "Fail to RemoveServersInBatch, expected " << servers.size()
-        << " actually " << n;
     return n;
 }
 
@@ -160,7 +162,7 @@ int WeightedRoundRobinLoadBalancer::SelectServer(const SelectIn& in, SelectOut* 
         return ENODATA;
     }
     TLS& tls = s.tls();
-    if (tls.IsNeededCaculateNewStride(s->weight_sum, s->server_list.size())) {
+    if (tls.IsNeededCalculateNewStride(s->weight_sum, s->server_list.size())) {
       if (tls.stride == 0) {
           tls.position = butil::fast_rand_less_than(s->server_list.size());
       }
@@ -173,14 +175,15 @@ int WeightedRoundRobinLoadBalancer::SelectServer(const SelectIn& in, SelectOut* 
         tls.remain_server.id != s->server_list[tls.position].id) {
         tls.remain_server.weight = 0;
     }
-    // The servers that can not be choosed.
+    // The servers that can not be chosen.
     std::unordered_set<SocketId> filter;
     TLS tls_temp = tls;
     uint64_t remain_weight = s->weight_sum;
     size_t remain_servers = s->server_list.size();
     while (remain_servers > 0) {
         SocketId server_id = GetServerInNextStride(s->server_list, filter, tls_temp);
-        if (!ExcludedServers::IsExcluded(in.excluded, server_id)
+        if ((remain_servers == 1 // always take last chance
+                || !ExcludedServers::IsExcluded(in.excluded, server_id))
             && Socket::Address(server_id, out->ptr) == 0
             && (*out->ptr)->IsAvailable()) {
             // update tls.
@@ -194,7 +197,7 @@ int WeightedRoundRobinLoadBalancer::SelectServer(const SelectIn& in, SelectOut* 
             }
             filter.emplace(server_id);
             remain_weight -= (s->server_list[s->server_map.at(server_id)]).weight;
-            // Select from begining status.
+            // Select from beginning status.
             tls_temp.stride = GetStride(remain_weight, remain_servers);
             tls_temp.position = tls.position;
             tls_temp.remain_server = tls.remain_server;

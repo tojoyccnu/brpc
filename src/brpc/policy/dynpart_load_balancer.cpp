@@ -95,9 +95,6 @@ size_t DynPartLoadBalancer::AddServersInBatch(
 size_t DynPartLoadBalancer::RemoveServersInBatch(
     const std::vector<ServerId>& servers) {
     const size_t n = _db_servers.Modify(BatchRemove, servers);
-    LOG_IF(ERROR, n != servers.size())
-        << "Fail to RemoveServersInBatch, expected " << servers.size()
-        << " actually " << n;
     return n;
 }
 
@@ -127,13 +124,9 @@ int DynPartLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
                 && Socket::Address(id, &ptrs[nptr].first) == 0) {
                 int w = schan::GetSubChannelWeight(ptrs[nptr].first->user());
                 total_weight += w;
-                if (nptr < 8) {
-                    ptrs[nptr].second = total_weight;
-                    ++nptr;
-                } else {
-                    CHECK(false) << "Not supported yet";
-                    abort();
-                }
+                RELEASE_ASSERT_VERBOSE(nptr < 8, "Not supported yet");
+                ptrs[nptr].second = total_weight;
+                ++nptr;
             }
         }
         if (nptr != 0) {

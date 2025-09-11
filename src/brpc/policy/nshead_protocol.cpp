@@ -26,6 +26,7 @@
 #include "brpc/socket.h"                   // Socket
 #include "brpc/server.h"                   // Server
 #include "brpc/span.h"
+#include "brpc/rpc_dump.h"
 #include "brpc/details/server_private_accessor.h"
 #include "brpc/details/controller_private_accessor.h"
 #include "brpc/nshead_service.h"
@@ -94,6 +95,7 @@ void NsheadClosure::Run() {
         return;
     }
 
+    int64_t sent_us = 0;
     if (_do_respond) {
         // response uses request's head as default.
         // Notice that the response use request.head.log_id directly rather
@@ -111,8 +113,15 @@ void NsheadClosure::Run() {
         write_buf.append(_response.body.movable());
         // Have the risk of unlimited pending responses, in which case, tell
         // users to set max_concurrency.
+        ResponseWriteInfo args;
         Socket::WriteOptions wopt;
         wopt.ignore_eovercrowded = true;
+        bthread_id_t response_id = INVALID_BTHREAD_ID;
+        if (span) {
+            CHECK_EQ(0, bthread_id_create(&response_id, &args, HandleResponseWritten));
+            wopt.id_wait = response_id;
+            wopt.notify_on_success = true;
+        }
         if (sock->Write(&write_buf, &wopt) != 0) {
             const int errcode = errno;
             PLOG_IF(WARNING, errcode != EPIPE) << "Fail to write into " << *sock;
@@ -120,10 +129,16 @@ void NsheadClosure::Run() {
                                   sock->description().c_str());
             return;
         }
+
+        if (span) {
+            bthread_id_join(response_id);
+            // Do not care about the result of background writing.
+            sent_us = args.sent_us;
+        }
     }
     if (span) {
         // TODO: this is not sent
-        span->set_sent_us(butil::cpuwide_time_us());
+        span->set_sent_us(0 == sent_us ? butil::cpuwide_time_us() : sent_us);
     }
 }
 
@@ -168,6 +183,7 @@ ParseResult ParseNsheadMessage(butil::IOBuf* source,
     return MakeMessage(msg);
 }
 
+namespace {
 struct CallMethodInBackupThreadArgs {
     NsheadService* service;
     const Server* server;
@@ -176,6 +192,7 @@ struct CallMethodInBackupThreadArgs {
     NsheadMessage* response;
     NsheadClosure* done;
 };
+}
 
 static void CallMethodInBackupThread(void* void_args) {
     CallMethodInBackupThreadArgs* args = (CallMethodInBackupThreadArgs*)void_args;
@@ -227,6 +244,15 @@ void ProcessNsheadRequest(InputMessageBase* msg_base) {
         LOG(FATAL) << "Fail to new NsheadClosure";
         socket->SetFailed();
         return;
+    }
+
+    // for nshead sample request
+    SampledRequest* sample = AskToBeSampled();
+    if (sample) {
+        sample->meta.set_protocol_type(PROTOCOL_NSHEAD);
+        sample->meta.set_nshead(p, sizeof(nshead_t)); // nshead
+        sample->request = msg->payload;
+        sample->submit(start_parse_us);
     }
 
     // Switch to service-specific error.
@@ -289,7 +315,7 @@ void ProcessNsheadRequest(InputMessageBase* msg_base) {
             cntl->SetFailed(ELOGOFF, "Server is stopping");
             break;
         }
-        if (socket->is_overcrowded()) {
+        if (socket->is_overcrowded() && !server->options().ignore_eovercrowded) {
             cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
                             butil::endpoint2str(socket->remote_side()).c_str());
             break;
@@ -305,9 +331,12 @@ void ProcessNsheadRequest(InputMessageBase* msg_base) {
                             " -usercode_in_pthread is on");
             break;
         }
+        if (!server->AcceptRequest(cntl)) {
+            break;
+        }
     } while (false);
 
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     if (span) {
         span->ResetServerSpanName(service->_cached_name);
         span->set_start_callback_us(butil::cpuwide_time_us());
@@ -357,7 +386,7 @@ void ProcessNsheadResponse(InputMessageBase* msg_base) {
 
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     accessor.OnResponse(cid, saved_error);
 }
 

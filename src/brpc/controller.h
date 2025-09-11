@@ -22,7 +22,9 @@
 // To brpc developers: This is a header included by user, don't depend
 // on internal structures, use opaque pointers instead.
 
+#include <functional>                          // std::function
 #include <gflags/gflags.h>                     // Users often need gflags
+#include <string>
 #include "butil/intrusive_ptr.hpp"             // butil::intrusive_ptr
 #include "bthread/errno.h"                     // Redefine errno
 #include "butil/endpoint.h"                    // butil::EndPoint
@@ -43,6 +45,8 @@
 #include "brpc/progressive_attachment.h"       // ProgressiveAttachment
 #include "brpc/progressive_reader.h"           // ProgressiveReader
 #include "brpc/grpc.h"
+#include "brpc/kvmap.h"
+#include "brpc/rpc_dump.h"
 
 // EAUTH is defined in MAC
 #ifndef EAUTH
@@ -65,9 +69,9 @@ class SharedLoadBalancer;
 class ExcludedServers;
 class RPCSender;
 class StreamSettings;
-class SampledRequest;
 class MongoContext;
 class RetryPolicy;
+class BackupRequestPolicy;
 class InputMessageBase;
 class ThriftStub;
 namespace policy {
@@ -102,6 +106,8 @@ enum StopStyle {
 
 const int32_t UNSET_MAGIC_NUM = -123456789;
 
+typedef butil::FlatMap<std::string, std::string> UserFieldsMap;
+
 // A Controller mediates a single method call. The primary purpose of
 // the controller is to provide a way to manipulate settings per RPC-call 
 // and to find out about RPC-level errors.
@@ -117,7 +123,9 @@ friend class schan::Sender;
 friend class schan::SubDone;
 friend class policy::OnServerStreamCreated;
 friend int StreamCreate(StreamId*, Controller&, const StreamOptions*);
+friend int StreamCreate(StreamIds&, int, Controller&, const StreamOptions*);
 friend int StreamAccept(StreamId*, Controller&, const StreamOptions*);
+friend int StreamAccept(StreamIds&, Controller&, const StreamOptions*);
 friend void policy::ProcessMongoRequest(InputMessageBase*);
 friend void policy::ProcessThriftRequest(InputMessageBase*);
     // << Flags >>
@@ -136,14 +144,29 @@ friend void policy::ProcessThriftRequest(InputMessageBase*);
     static const uint32_t FLAGS_PB_BYTES_TO_BASE64 = (1 << 11);
     static const uint32_t FLAGS_ALLOW_DONE_TO_RUN_IN_PLACE = (1 << 12);
     static const uint32_t FLAGS_USED_BY_RPC = (1 << 13);
-    static const uint32_t FLAGS_REQUEST_WITH_AUTH = (1 << 15);
     static const uint32_t FLAGS_PB_JSONIFY_EMPTY_ARRAY = (1 << 16);
     static const uint32_t FLAGS_ENABLED_CIRCUIT_BREAKER = (1 << 17);
     static const uint32_t FLAGS_ALWAYS_PRINT_PRIMITIVE_FIELDS = (1 << 18);
     static const uint32_t FLAGS_HEALTH_CHECK_CALL = (1 << 19);
-    
+    static const uint32_t FLAGS_PB_SINGLE_REPEATED_TO_ARRAY = (1 << 20);
+    static const uint32_t FLAGS_MANAGE_HTTP_BODY_ON_ERROR = (1 << 21);
+    static const uint32_t FLAGS_WRITE_TO_SOCKET_IN_BACKGROUND = (1 << 22);
+
+public:
+    struct Inheritable {
+        Inheritable() : log_id(0) {}
+        void Reset() {
+            log_id = 0;
+            request_id.clear();
+        }
+
+        uint64_t log_id;
+        std::string request_id;
+    };
+
 public:
     Controller();
+    Controller(const Inheritable& parent_ctx);
     ~Controller();
     
     // ------------------------------------------------------------------
@@ -160,7 +183,10 @@ public:
     // Set/get the delay to send backup request in milliseconds. Use
     // ChannelOptions.backup_request_ms on unset.
     void set_backup_request_ms(int64_t timeout_ms);
-    int64_t backup_request_ms() const { return _backup_request_ms; }
+    void set_backup_request_policy(BackupRequestPolicy* policy) {
+        _backup_request_policy = policy;
+    }
+    int64_t backup_request_ms() const;
 
     // Set/get maximum times of retrying. Use ChannelOptions.max_retry on unset.
     // <=0 means no retry.
@@ -199,6 +225,8 @@ public:
     // queries following the topology of servers) with a same log_id.
     void set_log_id(uint64_t log_id);
 
+    void set_request_id(std::string request_id) { _inheritable.request_id = request_id; }
+
     // Set type of service: http://en.wikipedia.org/wiki/Type_of_service
     // Current implementation has limits: If the connection is already
     // established, this setting has no effect until the connection is broken
@@ -212,6 +240,9 @@ public:
 
     // Set compression method for request.
     void set_request_compress_type(CompressType t) { _request_compress_type = t; }
+
+    // Set checksum type for request.
+    void set_request_checksum_type(ChecksumType t) { _request_checksum_type = t; }
 
     // Required by some load balancers.
     void set_request_code(uint64_t request_code) {
@@ -234,6 +265,24 @@ public:
         _http_request = NULL;
         return tmp;
     }
+
+    UserFieldsMap* request_user_fields() {
+        if (!_request_user_fields) {
+            _request_user_fields = new UserFieldsMap;
+        }
+        return _request_user_fields;
+    }
+
+    bool has_request_user_fields() const { return _request_user_fields; }
+
+    UserFieldsMap* response_user_fields() {
+        if (!_response_user_fields) {
+            _response_user_fields = new UserFieldsMap;
+        }
+        return _response_user_fields;
+    }
+
+    bool has_response_user_fields() const { return _response_user_fields; }
 
     // User attached data or body of http request, which is wired to network
     // directly instead of being serialized into protobuf messages.
@@ -263,7 +312,9 @@ public:
     // Get/own SampledRequest for sending dumped requests.
     // Deleted along with controller.
     void reset_sampled_request(SampledRequest* req);
-    const SampledRequest* sampled_request() { return _sampled_request; }
+    const SampledRequest* sampled_request() const { return _sampled_request; }
+    SampledRequest* release_sampled_request();
+
 
     // Attach a StreamCreator to this RPC. Notice that the ownership of sc has
     // been transferred to cntl, and sc->DestroyStreamCreator() would be called
@@ -273,6 +324,9 @@ public:
     // Make the RPC end when the HTTP response has complete headers and let
     // user read the remaining body by using ReadProgressiveAttachmentBy().
     void response_will_be_read_progressively() { add_flag(FLAGS_READ_PROGRESSIVELY); }
+    // Make the RPC end when the HTTP request has complete headers and let
+    // user read the remaining body by using ReadProgressiveAttachmentBy().
+    void request_will_be_read_progressively() { add_flag(FLAGS_READ_PROGRESSIVELY); }
     // True if response_will_be_read_progressively() was called.
     bool is_response_read_progressively() const { return has_flag(FLAGS_READ_PROGRESSIVELY); }
 
@@ -301,6 +355,11 @@ public:
     void set_pb_bytes_to_base64(bool f) { set_flag(FLAGS_PB_BYTES_TO_BASE64, f); }
     bool has_pb_bytes_to_base64() const { return has_flag(FLAGS_PB_BYTES_TO_BASE64); }
 
+    // Set if the single repeated field in protobuf message should be encoded
+    // as array when serialize/deserialize to/from json.
+    void set_pb_single_repeated_to_array(bool f) { set_flag(FLAGS_PB_SINGLE_REPEATED_TO_ARRAY, f); }
+    bool has_pb_single_repeated_to_array() const { return has_flag(FLAGS_PB_SINGLE_REPEATED_TO_ARRAY); }
+
     // Set if convert the repeated field that has no entry to a empty array
     // of json in HTTP response.
     void set_pb_jsonify_empty_array(bool f) { set_flag(FLAGS_PB_JSONIFY_EMPTY_ARRAY, f); }
@@ -326,6 +385,17 @@ public:
     // True iff above method was called.
     bool is_done_allowed_to_run_in_place() const
     { return has_flag(FLAGS_ALLOW_DONE_TO_RUN_IN_PLACE); }
+
+    // Create a background KEEPWRITE bthread to write to socket when issuing
+    // RPCs, instead of trying to write to socket once in calling thread (see
+    // `Socket::StartWrite` in socket.cpp).
+    // The socket write could take some time (several microseconds maybe), if
+    // you cares about it and don't want the calling thread to be blocked, you
+    // can set this flag.
+    // Should provides better batch effect in situations like when you are
+    // continually issuing lots of async RPC calls in only one thread.
+    void set_write_to_socket_in_background(bool f) { set_flag(FLAGS_WRITE_TO_SOCKET_IN_BACKGROUND, f); }
+    bool write_to_socket_in_background() const { return has_flag(FLAGS_WRITE_TO_SOCKET_IN_BACKGROUND); }
 
     // ------------------------------------------------------------------------
     //                      Server-side methods.
@@ -376,16 +446,30 @@ public:
     // directly instead of being serialized into protobuf messages.
     butil::IOBuf& response_attachment() { return _response_attachment; }
 
+    // Response Body of a failed HTTP call is set to be ErrorText() by default,
+    // even if response_attachment() is non-empty.
+    // If this flag is true, the http body of a failed HTTP call will not be
+    // replaced by ErrorText() and should be managed by user self.
+    void manage_http_body_on_error(bool manage_or_not)
+    { set_flag(FLAGS_MANAGE_HTTP_BODY_ON_ERROR, manage_or_not); }
+    
+    bool does_manage_http_body_on_error() const
+    { return has_flag(FLAGS_MANAGE_HTTP_BODY_ON_ERROR); }
+
     // Create a ProgressiveAttachment to write (often after RPC).
     // If `stop_style' is FORCE_STOP, the underlying socket will be failed
     // immediately when the socket becomes idle or server is stopped.
     // Default value of `stop_style' is WAIT_FOR_STOP.
-    ProgressiveAttachment*
+    butil::intrusive_ptr<ProgressiveAttachment>
     CreateProgressiveAttachment(StopStyle stop_style = WAIT_FOR_STOP);
+
     bool has_progressive_writer() const { return _wpa != NULL; }
 
     // Set compression method for response.
     void set_response_compress_type(CompressType t) { _response_compress_type = t; }
+
+    // Set checksum type for response.
+    void set_response_checksum_type(ChecksumType t) { _response_checksum_type = t; }
     
     // Non-zero when this RPC call is traced (by rpcz or rig).
     // NOTE: Only valid at server-side, always zero at client-side.
@@ -468,10 +552,14 @@ public:
     int ErrorCode() const { return _error_code; }
 
     // Getters:
+    const Inheritable& inheritable() { return _inheritable; }
     bool has_log_id() const { return has_flag(FLAGS_LOG_ID); }
-    uint64_t log_id() const { return _log_id; }
+    uint64_t log_id() const { return _inheritable.log_id; }
+    const std::string& request_id() const { return _inheritable.request_id; }
     CompressType request_compress_type() const { return _request_compress_type; }
     CompressType response_compress_type() const { return _response_compress_type; }
+    ChecksumType request_checksum_type() const { return _request_checksum_type; }
+    ChecksumType response_checksum_type() const { return _response_checksum_type; }
     const HttpHeader& http_request() const 
     { return _http_request != NULL ? *_http_request : DefaultHttpHeader(); }
     
@@ -480,6 +568,24 @@ public:
 
     const butil::IOBuf& request_attachment() const { return _request_attachment; }
     const butil::IOBuf& response_attachment() const { return _response_attachment; }
+
+    // Get the object to write key/value which will be flushed into
+    // LOG(INFO) when this controller is deleted.
+    KVMap& SessionKV();
+    
+    // Flush SessionKV() into `os'
+    void FlushSessionKV(std::ostream& os);
+
+    // Contextual prefixes for LOGD/LOGI/LOGW/LOGE/LOGF macros
+    class LogPrefixDummy {
+    public:
+        LogPrefixDummy(const Controller* cntl) : _cntl(cntl) {}
+        void DoPrintLogPrefix(std::ostream& os) const { _cntl->DoPrintLogPrefix(os); }
+    private:
+        const Controller* _cntl;
+    };
+    friend class LogPrefixDummy;
+    LogPrefixDummy LogPrefix() const { return LogPrefixDummy(this); }
 
     // Return true if the remote side creates a stream.
     bool has_remote_stream() { return _remote_stream_settings != NULL; }
@@ -509,6 +615,39 @@ public:
     // Get deadline of this RPC (since the Epoch in microseconds).
     // -1 means no deadline.
     int64_t deadline_us() const { return _deadline_us; }
+
+    using AfterRpcRespFnType = std::function<void(Controller* cntl,
+                                               const google::protobuf::Message* req,
+                                               const google::protobuf::Message* res)>;
+
+    void set_after_rpc_resp_fn(AfterRpcRespFnType&& fn) { _after_rpc_resp_fn = fn; }
+
+    void CallAfterRpcResp(const google::protobuf::Message* req, const google::protobuf::Message* res);
+
+    void set_request_content_type(ContentType type) {
+        _request_content_type = type;
+    }
+    ContentType request_content_type() const {
+        return _request_content_type;
+    }
+
+    void set_response_content_type(ContentType type) {
+        _response_content_type = type;
+    }
+    ContentType response_content_type() const {
+        return _response_content_type;
+    }
+
+    // If brpc acts as a server, this interface exposes the time when the RPC was received from the
+    // socket. This function can be used in scenarios where the user code needs to understand the RPC
+    // reception time, such as for precise control of timeouts. Users will require timing to start
+    // from the receipt of the RPC. When the user processing function starts to handle the RPC, if
+    // it is found that the RPC has timed out, it will be directly discarded
+    void set_rpc_received_us(int64_t received_us) { _rpc_received_us = received_us; }
+
+    // Get the received time of RPC (in microseconds), if the returned value is 0, it means that
+    // the received time of RPC is not recorded in the controller.
+    int64_t get_rpc_received_us() const { return _rpc_received_us; }
 
 private:
     struct CompletionInfo {
@@ -568,10 +707,12 @@ private:
     struct ClientSettings {
         int32_t timeout_ms;
         int32_t backup_request_ms;
-        int max_retry;                      
+        BackupRequestPolicy* backup_request_policy;
+        int max_retry;
         int32_t tos;
         ConnectionType connection_type;         
         CompressType request_compress_type;
+        ChecksumType request_checksum_type;
         uint64_t log_id;
         bool has_request_code;
         int64_t request_code;
@@ -635,9 +776,7 @@ private:
         _end_time_us = begin_time_us;
     }
 
-    void OnRPCEnd(int64_t end_time_us) {
-        _end_time_us = end_time_us;
-    }
+    void OnRPCEnd(int64_t end_time_us);
 
     static void RunDoneInBackupThread(void*);
     void DoneInBackupThread();
@@ -658,6 +797,8 @@ private:
 
     std::string& protocol_param() { return _thrift_method_name; }
     const std::string& protocol_param() const { return _thrift_method_name; }
+
+    void DoPrintLogPrefix(std::ostream& os) const;
 
 private:
     // NOTE: align and group fields to make Controller as compact as possible.
@@ -681,7 +822,7 @@ private:
     // after CallMethod.
     int _max_retry;
     const RetryPolicy* _retry_policy;
-    // Synchronization object for one RPC call. It remains unchanged even 
+    // Synchronization object for one RPC call. It remains unchanged even
     // when retry happens. Synchronous RPC will wait on this id.
     CallId _correlation_id;
 
@@ -696,6 +837,10 @@ private:
     int32_t _timeout_ms;
     int32_t _connect_timeout_ms;
     int32_t _backup_request_ms;
+    // Priority: `_backup_request_policy' > `_backup_request_ms'.
+    BackupRequestPolicy* _backup_request_policy;
+    // If this rpc call has retry/backup request,this var save the real timeout for current call
+    int64_t _real_timeout_ms;
     // Deadline of this RPC (since the Epoch in microseconds).
     int64_t _deadline_us;
     // Timer registered to trigger RPC timeout event
@@ -709,7 +854,10 @@ private:
     int _preferred_index;
     CompressType _request_compress_type;
     CompressType _response_compress_type;
-    uint64_t _log_id;
+    ChecksumType _request_checksum_type;
+    ChecksumType _response_checksum_type;
+    std::string _checksum_value;
+    Inheritable _inheritable;
     int _pchan_sub_count;
     google::protobuf::Message* _response;
     google::protobuf::Closure* _done;
@@ -738,9 +886,20 @@ private:
     HttpHeader* _http_request;
     HttpHeader* _http_response;
 
+    // User fields of baidu_std protocol.
+    UserFieldsMap* _request_user_fields;
+    UserFieldsMap* _response_user_fields;
+
+    std::unique_ptr<KVMap> _session_kv;
+
     // Fields with large size but low access frequency 
     butil::IOBuf _request_attachment;
     butil::IOBuf _response_attachment;
+
+    // Only SerializedRequest supports `_request_content_type'.
+    ContentType _request_content_type;
+    // Only SerializedResponse supports `_response_content_type'.
+    ContentType _response_content_type;
 
     // Writable progressive attachment
     butil::intrusive_ptr<ProgressiveAttachment> _wpa;
@@ -749,14 +908,21 @@ private:
 
     // TODO: Replace following fields with StreamCreator
     // Defined at client side
-    StreamId _request_stream;
+    StreamIds _request_streams;
     // Defined at server side
-    StreamId _response_stream;
+    StreamIds _response_streams;
     // Defined at both sides
     StreamSettings *_remote_stream_settings;
 
     // Thrift method name, only used when thrift protocol enabled
     std::string _thrift_method_name;
+
+    uint32_t _auth_flags;
+
+    AfterRpcRespFnType _after_rpc_resp_fn;
+
+    // The point in time when the rpc is read from the socket
+    int64_t _rpc_received_us;
 };
 
 // Advises the RPC system that the caller desires that the RPC call be
@@ -779,6 +945,7 @@ google::protobuf::Closure* DoNothing();
 
 // Convert non-web symbols to web equivalence.
 void WebEscape(const std::string& source, std::string* output);
+std::string WebEscape(const std::string& source);
 
 // True if Ctrl-C is ever pressed.
 bool IsAskedToQuit();
@@ -786,7 +953,28 @@ bool IsAskedToQuit();
 // Send Ctrl-C to current process.
 void AskToQuit();
 
+std::ostream& operator<<(std::ostream& os, const Controller::LogPrefixDummy& p);
+
 } // namespace brpc
 
+// Print contextual logs prefixed with "@rid=REQUEST_ID" which marks a session
+// and eases debugging. The REQUEST_ID is carried in http/rpc request or 
+// inherited from another controller.
+// As a server:
+//   Call CLOG*(cntl) << ... to log instead of LOG(*) << ..
+// As a client:
+//   Inside a service:
+//     Use Controller(service_cntl->inheritable()) to create controllers which 
+//     inherit session info from the service's requests
+//   Standalone brpc client:
+//     Set cntl->set_request_id(REQUEST_ID);
+//   Standalone http client:
+//     Set header 'X-REQUEST-ID'
+#define CLOGD(cntl) LOG(DEBUG) << (cntl)->LogPrefix()
+#define CLOGI(cntl) LOG(INFO) << (cntl)->LogPrefix()
+#define CLOGW(cntl) LOG(WARNING) << (cntl)->LogPrefix()
+#define CLOGE(cntl) LOG(ERROR) << (cntl)->LogPrefix()
+#define CLOGF(cntl) LOG(FATAL) << (cntl)->LogPrefix()
+#define CVLOG(v, cntl) VLOG(v) << (cntl)->LogPrefix()
 
 #endif  // BRPC_CONTROLLER_H

@@ -23,7 +23,8 @@
 #define BUTIL_IOBUF_H
 
 #include <sys/uio.h>                             // iovec
-#include <stdint.h>                              // uint32_t
+#include <stdint.h>                              // uint32_t, int64_t
+#include <functional>
 #include <string>                                // std::string
 #include <ostream>                               // std::ostream
 #include <google/protobuf/io/zero_copy_stream.h> // ZeroCopyInputStream
@@ -63,6 +64,8 @@ friend class IOBufAsZeroCopyInputStream;
 friend class IOBufAsZeroCopyOutputStream;
 friend class IOBufBytesIterator;
 friend class IOBufCutter;
+friend class SingleIOBuf;
+
 public:
     static const size_t DEFAULT_BLOCK_SIZE = 8192;
     static const size_t INITIAL_CAP = 32; // must be power of 2
@@ -246,7 +249,16 @@ public:
     // Append the user-data to back side WITHOUT copying.
     // The user-data can be split and shared by smaller IOBufs and will be
     // deleted using the deleter func when no IOBuf references it anymore.
-    int append_user_data(void* data, size_t size, void (*deleter)(void*));
+    int append_user_data(void* data, size_t size, std::function<void(void*)> deleter);
+
+    // Append the user-data to back side WITHOUT copying.
+    // The meta is associated with this piece of user-data.
+    int append_user_data_with_meta(void* data, size_t size, std::function<void(void*)> deleter, uint64_t meta);
+
+    // Get the data meta of the first byte in this IOBuf.
+    // The meta is specified with append_user_data_with_meta before.
+    // 0 means the meta is invalid.
+    uint64_t get_first_data_meta();
 
     // Resizes the buf to a length of n characters.
     // If n is smaller than the current length, all bytes after n will be
@@ -296,9 +308,9 @@ public:
     // Returns bytes copied.
     size_t copy_to(void* buf, size_t n = (size_t)-1L, size_t pos = 0) const;
 
-    // NOTE: first parameter is not std::string& because user may passes
-    // a pointer of std::string by mistake, in which case, compiler would
-    // call the void* version which crashes definitely.
+    // NOTE: first parameter is not std::string& because user may pass in
+    // a pointer of std::string by mistake, in which case, the void* overload
+    // would be wrongly called.
     size_t copy_to(std::string* s, size_t n = (size_t)-1L, size_t pos = 0) const;
     size_t append_to(std::string* s, size_t n = (size_t)-1L, size_t pos = 0) const;
 
@@ -479,6 +491,17 @@ private:
     Block* _block;
 };
 
+class IOReserveAlignedBuf : public IOBuf {
+public:
+    IOReserveAlignedBuf(size_t alignment)
+        : _alignment(alignment), _reserved(false) {}
+    Area reserve(size_t count);
+
+private:
+    size_t _alignment;
+    bool _reserved;
+};
+
 // Specialized utility to cut from IOBuf faster than using corresponding
 // methods in IOBuf.
 // Designed for efficiently parsing data from IOBuf.
@@ -541,12 +564,12 @@ public:
     bool Next(const void** data, int* size) override;
     void BackUp(int count) override;
     bool Skip(int count) override;
-    google::protobuf::int64 ByteCount() const override;
+    int64_t ByteCount() const override;
 
 private:
     int _ref_index;
     int _add_offset;
-    google::protobuf::int64 _byte_count;
+    int64_t _byte_count;
     const IOBuf* _buf;
 };
 
@@ -560,7 +583,7 @@ private:
 //     some_pb_message.SerializeToZeroCopyStream(&wrapper);
 //
 // NOTE: Blocks are by default shared among all the ZeroCopyOutputStream in one
-// thread. If there are many manuplated streams at one time, there may be many
+// thread. If there are many manipulated streams at one time, there may be many
 // fragments. You can create a ZeroCopyOutputStream which has its own block by 
 // passing a positive `block_size' argument to avoid this problem.
 class IOBufAsZeroCopyOutputStream
@@ -572,7 +595,7 @@ public:
 
     bool Next(void** data, int* size) override;
     void BackUp(int count) override; // `count' can be as long as ByteCount()
-    google::protobuf::int64 ByteCount() const override;
+    int64_t ByteCount() const override;
 
 private:
     void _release_block();
@@ -580,10 +603,10 @@ private:
     IOBuf* _buf;
     uint32_t _block_size;
     IOBuf::Block *_cur_block;
-    google::protobuf::int64 _byte_count;
+    int64_t _byte_count;
 };
 
-// Wrap IOBuf into input of snappy compresson.
+// Wrap IOBuf into input of snappy compression.
 class IOBufAsSnappySource : public butil::snappy::Source {
 public:
     explicit IOBufAsSnappySource(const butil::IOBuf& buf)

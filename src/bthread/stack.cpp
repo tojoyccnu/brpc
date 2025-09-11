@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// bthread - A M:N threading library to make applications more concurrent.
+// bthread - An M:N threading library to make applications more concurrent.
 
 // Date: Sun Sep  7 22:37:39 CST 2014
 
@@ -139,7 +139,7 @@ void deallocate_stack_storage(StackStorage* s) {
         return;
     }
     s_stack_count.fetch_sub(1, butil::memory_order_relaxed);
-    if (s->guardsize <= 0) {
+    if (s->guardsize == 0) {
         free((char*)s->bottom - memsize);
     } else {
         munmap((char*)s->bottom - memsize, memsize);

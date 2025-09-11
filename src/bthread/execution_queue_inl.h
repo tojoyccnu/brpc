@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// bthread - A M:N threading library to make applications more concurrent.
+// bthread - An M:N threading library to make applications more concurrent.
 
 // Date: 2015/10/27 17:39:48
 
@@ -27,8 +27,10 @@
 #include "butil/memory/scoped_ptr.h"     // butil::scoped_ptr
 #include "butil/logging.h"               // LOG
 #include "butil/time.h"                  // butil::cpuwide_time_ns
-#include "bvar/bvar.h"                  // bvar::Adder
-#include "bthread/butex.h"              // butex_construct
+#include "butil/object_pool.h"           // butil::get_object
+#include "bvar/bvar.h"                   // bvar::Adder
+#include "bthread/butex.h"               // butex_construct
+#include "butil/synchronization/condition_variable.h"
 
 namespace bthread {
 
@@ -37,17 +39,17 @@ struct ExecutionQueueId {
     uint64_t value;
 };
 
-enum TaskStatus {
-    UNEXECUTED = 0,
-    EXECUTING = 1,
-    EXECUTED = 2
-};
-
 struct TaskNode;
 class ExecutionQueueBase;
 typedef void (*clear_task_mem)(TaskNode*);
 
 struct BAIDU_CACHELINE_ALIGNMENT TaskNode {
+    enum TaskStatus {
+        UNEXECUTED = 0,
+        EXECUTING = 1,
+        EXECUTED = 2
+    };
+
     TaskNode()
         : version(0)
         , status(UNEXECUTED)
@@ -168,7 +170,9 @@ public:
         : _head(NULL)
         , _versioned_ref(0)  // join() depends on even version
         , _high_priority_tasks(0)
-    {
+        , _pthread_started(false)
+        , _cond(&_mutex)
+        , _current_head(NULL) {
         _join_butex = butex_create_checked<butil::atomic<int> >();
         _join_butex->store(0, butil::memory_order_relaxed);
     }
@@ -203,6 +207,7 @@ private:
     void _on_recycle();
     int _execute(TaskNode* head, bool high_priority, int* niterated);
     static void* _execute_tasks(void* arg);
+    static void* _execute_tasks_pthread(void* arg);
 
     static inline uint32_t _version_of_id(uint64_t id) WARN_UNUSED_RESULT {
         return (uint32_t)(id >> 32);
@@ -223,9 +228,9 @@ private:
 
     // Don't change the order of _head, _versioned_ref and _stopped unless you 
     // see improvement of performance in test
-    butil::atomic<TaskNode*> BAIDU_CACHELINE_ALIGNMENT _head;
-    butil::atomic<uint64_t> BAIDU_CACHELINE_ALIGNMENT _versioned_ref;
-    butil::atomic<bool> BAIDU_CACHELINE_ALIGNMENT _stopped;
+    BAIDU_CACHELINE_ALIGNMENT butil::atomic<TaskNode*> _head;
+    BAIDU_CACHELINE_ALIGNMENT butil::atomic<uint64_t> _versioned_ref;
+    BAIDU_CACHELINE_ALIGNMENT butil::atomic<bool> _stopped;
     butil::atomic<int64_t> _high_priority_tasks;
     uint64_t _this_id;
     void* _meta;
@@ -234,6 +239,13 @@ private:
     clear_task_mem _clear_func;
     ExecutionQueueOptions _options;
     butil::atomic<int>* _join_butex;
+
+    // For pthread mode.
+    pthread_t _pid;
+    bool _pthread_started;
+    butil::Mutex _mutex;
+    butil::ConditionVariable _cond;
+    TaskNode* _current_head; // Current task head of each execution.
 };
 
 template <typename T>
@@ -290,6 +302,16 @@ public:
 
     int execute(typename butil::add_const_reference<T>::type task,
                 const TaskOptions* options, TaskHandle* handle) {
+        return execute(std::forward<T>(const_cast<T&>(task)), options, handle);
+    }
+
+
+    int execute(T&& task) {
+        return execute(std::forward<T>(task), NULL, NULL);
+    }
+
+    int execute(T&& task,
+                const TaskOptions* options, TaskHandle* handle) {
         if (stopped()) {
             return EINVAL;
         }
@@ -302,7 +324,7 @@ public:
             return_task_node(node);
             return ENOMEM;
         }
-        new (mem) T(task);
+        new (mem) T(std::forward<T>(task));
         node->stop_task = false;
         TaskOptions opt;
         if (options) {
@@ -320,12 +342,14 @@ public:
 };
 
 inline ExecutionQueueOptions::ExecutionQueueOptions()
-    : bthread_attr(BTHREAD_ATTR_NORMAL), executor(NULL)
+    : use_pthread(false)
+    , bthread_attr(BTHREAD_ATTR_NORMAL)
+    , executor(NULL)
 {}
 
 template <typename T>
 inline int execution_queue_start(
-        ExecutionQueueId<T>* id, 
+        ExecutionQueueId<T>* id,
         const ExecutionQueueOptions* options,
         int (*execute)(void* meta, TaskIterator<T>&),
         void* meta) {
@@ -356,10 +380,37 @@ inline int execution_queue_execute(ExecutionQueueId<T> id,
                        typename butil::add_const_reference<T>::type task,
                        const TaskOptions* options,
                        TaskHandle* handle) {
-    typename ExecutionQueue<T>::scoped_ptr_t 
+    typename ExecutionQueue<T>::scoped_ptr_t
         ptr = ExecutionQueue<T>::address(id);
     if (ptr != NULL) {
         return ptr->execute(task, options, handle);
+    } else {
+        return EINVAL;
+    }
+}
+
+template <typename T>
+inline int execution_queue_execute(ExecutionQueueId<T> id,
+                                   T&& task) {
+    return execution_queue_execute(id, std::forward<T>(task), NULL);
+}
+
+template <typename T>
+inline int execution_queue_execute(ExecutionQueueId<T> id,
+                                   T&& task,
+                                   const TaskOptions* options) {
+    return execution_queue_execute(id, std::forward<T>(task), options, NULL);
+}
+
+template <typename T>
+inline int execution_queue_execute(ExecutionQueueId<T> id,
+                                   T&& task,
+                                   const TaskOptions* options,
+                                   TaskHandle* handle) {
+    typename ExecutionQueue<T>::scoped_ptr_t
+            ptr = ExecutionQueue<T>::address(id);
+    if (ptr != NULL) {
+        return ptr->execute(std::forward<T>(task), options, handle);
     } else {
         return EINVAL;
     }
@@ -518,9 +569,9 @@ inline int ExecutionQueueBase::dereference() {
                         butil::memory_order_acquire,
                         butil::memory_order_relaxed)) {
                 _on_recycle();
-                // We don't return m immediatly when the reference count
+                // We don't return m immediately when the reference count
                 // reaches 0 as there might be in processing tasks. Instead
-                // _on_recycle would push a `stop_task' after which is excuted
+                // _on_recycle would push a `stop_task' after which is executed
                 // m would be finally returned and reset
                 return 1;
             }
@@ -534,5 +585,12 @@ inline int ExecutionQueueBase::dereference() {
 }
 
 }  // namespace bthread
+
+namespace butil {
+// TaskNode::cancel() may access the TaskNode object returned to the ObjectPool<TaskNode>,
+// so ObjectPool<TaskNode> can not poison the memory region of TaskNode.
+template <>
+struct ObjectPoolWithASanPoison<bthread::TaskNode> : false_type {};
+} // namespace butil
 
 #endif  //BTHREAD_EXECUTION_QUEUE_INL_H

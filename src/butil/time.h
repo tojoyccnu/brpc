@@ -215,6 +215,7 @@ inline int64_t monotonic_time_s() {
 
 namespace detail {
 inline uint64_t clock_cycles() {
+#if defined(__x86_64__) || defined(__amd64__)
     unsigned int lo = 0;
     unsigned int hi = 0;
     // We cannot use "=A", since this would use %rax on x86_64
@@ -223,6 +224,39 @@ inline uint64_t clock_cycles() {
         : "=a" (lo), "=d" (hi)
         );
     return ((uint64_t)hi << 32) | lo;
+#elif defined(__aarch64__)
+    uint64_t virtual_timer_value;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(virtual_timer_value));
+    return virtual_timer_value;
+#elif defined(__ARM_ARCH)
+  #if (__ARM_ARCH >= 6)
+    unsigned int pmccntr;
+    unsigned int pmuseren;
+    unsigned int pmcntenset;
+    // Read the user mode perf monitor counter access permissions.
+    asm volatile ("mrc p15, 0, %0, c9, c14, 0" : "=r" (pmuseren));
+    if (pmuseren & 1) {  // Allows reading perfmon counters for user mode code.
+        asm volatile ("mrc p15, 0, %0, c9, c12, 1" : "=r" (pmcntenset));
+        if (pmcntenset & 0x80000000ul) {  // Is it counting?
+            asm volatile ("mrc p15, 0, %0, c9, c13, 0" : "=r" (pmccntr));
+            // The counter is set up to count every 64th cycle
+            return static_cast<uint64_t>(pmccntr) * 64;  // Should optimize to << 6
+        }
+    }
+  #else
+    #error "unsupported arm_arch"
+  #endif
+#elif defined(__loongarch64)
+    uint64_t stable_counter;
+    uint64_t counter_id;
+    __asm__ __volatile__ (
+        "rdtime.d %1, %0"
+        : "=r" (stable_counter), "=r" (counter_id)
+        );
+    return stable_counter;
+#else
+  #error "unsupported arch"
+#endif
 }
 extern int64_t read_invariant_cpu_frequency();
 // Be positive iff:
@@ -267,6 +301,14 @@ inline int64_t cpuwide_time_ns() {
         return cpuwide_time_ns();
     }
 #endif // defined(BAIDU_INTERNAL)
+}
+
+// Get cpu clock time of the current thread in nanoseconds without the time spent in blocking I/O operations.
+// Cost ~200ns
+inline int64_t cputhread_time_ns() {
+    timespec now;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+    return now.tv_sec * 1000000000L + now.tv_nsec;
 }
 
 inline int64_t cpuwide_time_us() {
@@ -342,7 +384,7 @@ public:
     };
 
     Timer() : _stop(0), _start(0) {}
-    explicit Timer(const TimerType) {
+    explicit Timer(const TimerType) : Timer() {
         start();
     }
 

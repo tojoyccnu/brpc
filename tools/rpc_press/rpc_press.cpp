@@ -71,6 +71,14 @@ bool set_press_options(pbrpcframework::PressOptions* options){
         }
     }
 
+    const int rate_limit_per_thread = 1000000;
+    double req_rate_per_thread = options->test_req_rate / options->test_thread_num;
+    if (req_rate_per_thread > rate_limit_per_thread) {
+        LOG(ERROR) << "req_rate: " << (int64_t) req_rate_per_thread << " is too large in one thread. The rate limit is " 
+                <<  rate_limit_per_thread << " in one thread";
+        return false;  
+    }
+
     options->input = FLAGS_input;
     options->output = FLAGS_output;
     options->connection_type = FLAGS_connection_type;
@@ -89,7 +97,7 @@ bool set_press_options(pbrpcframework::PressOptions* options){
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     // set global log option
 
     if (FLAGS_dummy_port >= 0) {

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// bthread - A M:N threading library to make applications more concurrent.
+// bthread - An M:N threading library to make applications more concurrent.
 
 // Date: Tue Jul 10 17:40:58 CST 2012
 
@@ -149,7 +149,7 @@ private:
     butil::atomic<size_t> _bottom;
     size_t _capacity;
     T* _buffer;
-    butil::atomic<size_t> BAIDU_CACHELINE_ALIGNMENT _top;
+    BAIDU_CACHELINE_ALIGNMENT butil::atomic<size_t> _top;
 };
 
 }  // namespace bthread

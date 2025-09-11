@@ -32,8 +32,8 @@ DEFINE_int32(idle_timeout_s, -1, "Connection will be closed if there is no "
 namespace example {
 class EchoServiceImpl : public EchoService {
 public:
-    EchoServiceImpl() {};
-    virtual ~EchoServiceImpl() {};
+    EchoServiceImpl() {}
+    virtual ~EchoServiceImpl() {}
     virtual void Echo(google::protobuf::RpcController*,
                       const EchoRequest* request,
                       EchoResponse* response,
@@ -97,7 +97,7 @@ public:
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     brpc::Server server;
     example::EchoServiceImpl echo_service_impl;

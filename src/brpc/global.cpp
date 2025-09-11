@@ -38,20 +38,31 @@
 #include "brpc/policy/remote_file_naming_service.h"
 #include "brpc/policy/consul_naming_service.h"
 #include "brpc/policy/discovery_naming_service.h"
+#include "brpc/policy/nacos_naming_service.h"
 
 // Load Balancers
 #include "brpc/policy/round_robin_load_balancer.h"
 #include "brpc/policy/weighted_round_robin_load_balancer.h"
 #include "brpc/policy/randomized_load_balancer.h"
+#include "brpc/policy/weighted_randomized_load_balancer.h"
 #include "brpc/policy/locality_aware_load_balancer.h"
 #include "brpc/policy/consistent_hashing_load_balancer.h"
 #include "brpc/policy/hasher.h"
 #include "brpc/policy/dynpart_load_balancer.h"
 
+
+// Span
+#include "brpc/span.h"
+#include "bthread/unstable.h"
+
 // Compress handlers
 #include "brpc/compress.h"
 #include "brpc/policy/gzip_compress.h"
 #include "brpc/policy/snappy_compress.h"
+
+// Checksum handlers
+#include "brpc/checksum.h"
+#include "brpc/policy/crc32c_checksum.h"
 
 // Protocols
 #include "brpc/protocol.h"
@@ -78,6 +89,7 @@
 #include "brpc/concurrency_limiter.h"
 #include "brpc/policy/auto_concurrency_limiter.h"
 #include "brpc/policy/constant_concurrency_limiter.h"
+#include "brpc/policy/timeout_concurrency_limiter.h"
 
 #include "brpc/input_messenger.h"     // get_or_new_client_side_messenger
 #include "brpc/socket_map.h"          // SocketMapList
@@ -115,7 +127,9 @@ const char* const DUMMY_SERVER_PORT_FILE = "dummy_server.port";
 
 struct GlobalExtensions {
     GlobalExtensions()
-        : ch_mh_lb(CONS_HASH_LB_MURMUR3)
+        : dns(80)
+        , dns_with_ssl(443)
+        , ch_mh_lb(CONS_HASH_LB_MURMUR3)
         , ch_md5_lb(CONS_HASH_LB_MD5)
         , ch_ketama_lb(CONS_HASH_LB_KETAMA)
         , constant_cl(0) {
@@ -126,14 +140,18 @@ struct GlobalExtensions {
 #endif
     FileNamingService fns;
     ListNamingService lns;
+    DomainListNamingService dlns;
     DomainNamingService dns;
+    DomainNamingService dns_with_ssl;
     RemoteFileNamingService rfns;
     ConsulNamingService cns;
     DiscoveryNamingService dcns;
+    NacosNamingService nns;
 
     RoundRobinLoadBalancer rr_lb;
     WeightedRoundRobinLoadBalancer wrr_lb;
     RandomizedLoadBalancer randomized_lb;
+    WeightedRandomizedLoadBalancer wr_lb;
     LocalityAwareLoadBalancer la_lb;
     ConsistentHashingLoadBalancer ch_mh_lb;
     ConsistentHashingLoadBalancer ch_md5_lb;
@@ -142,6 +160,7 @@ struct GlobalExtensions {
 
     AutoConcurrencyLimiter auto_cl;
     ConstantConcurrencyLimiter constant_cl;
+    TimeoutConcurrencyLimiter timeout_cl;
 };
 
 static pthread_once_t register_extensions_once = PTHREAD_ONCE_INIT;
@@ -282,6 +301,7 @@ static void* GlobalUpdate(void*) {
     return NULL;
 }
 
+#if GOOGLE_PROTOBUF_VERSION < 3022000
 static void BaiduStreamingLogHandler(google::protobuf::LogLevel level,
                                      const char* filename, int line,
                                      const std::string& message) {
@@ -301,6 +321,7 @@ static void BaiduStreamingLogHandler(google::protobuf::LogLevel level,
     }
     CHECK(false) << filename << ':' << line << ' ' << message;
 }
+#endif
 
 static void GlobalInitializeOrDieImpl() {
     //////////////////////////////////////////////////////////////////
@@ -313,11 +334,16 @@ static void GlobalInitializeOrDieImpl() {
     struct sigaction oldact;
     if (sigaction(SIGPIPE, NULL, &oldact) != 0 ||
             (oldact.sa_handler == NULL && oldact.sa_sigaction == NULL)) {
-        CHECK(NULL == signal(SIGPIPE, SIG_IGN));
+        CHECK(SIG_ERR != signal(SIGPIPE, SIG_IGN));
     }
 
+#if GOOGLE_PROTOBUF_VERSION < 3022000
     // Make GOOGLE_LOG print to comlog device
     SetLogHandler(&BaiduStreamingLogHandler);
+#endif
+
+    // Set bthread create span function
+    bthread_set_create_span_func(CreateBthreadSpan);
 
     // Setting the variable here does not work, the profiler probably check
     // the variable before main() for only once.
@@ -345,17 +371,20 @@ static void GlobalInitializeOrDieImpl() {
 #endif
     NamingServiceExtension()->RegisterOrDie("file", &g_ext->fns);
     NamingServiceExtension()->RegisterOrDie("list", &g_ext->lns);
+    NamingServiceExtension()->RegisterOrDie("dlist", &g_ext->dlns);
     NamingServiceExtension()->RegisterOrDie("http", &g_ext->dns);
-    NamingServiceExtension()->RegisterOrDie("https", &g_ext->dns);
+    NamingServiceExtension()->RegisterOrDie("https", &g_ext->dns_with_ssl);
     NamingServiceExtension()->RegisterOrDie("redis", &g_ext->dns);
     NamingServiceExtension()->RegisterOrDie("remotefile", &g_ext->rfns);
     NamingServiceExtension()->RegisterOrDie("consul", &g_ext->cns);
     NamingServiceExtension()->RegisterOrDie("discovery", &g_ext->dcns);
+    NamingServiceExtension()->RegisterOrDie("nacos", &g_ext->nns);
 
     // Load Balancers
     LoadBalancerExtension()->RegisterOrDie("rr", &g_ext->rr_lb);
     LoadBalancerExtension()->RegisterOrDie("wrr", &g_ext->wrr_lb);
     LoadBalancerExtension()->RegisterOrDie("random", &g_ext->randomized_lb);
+    LoadBalancerExtension()->RegisterOrDie("wr", &g_ext->wr_lb);
     LoadBalancerExtension()->RegisterOrDie("la", &g_ext->la_lb);
     LoadBalancerExtension()->RegisterOrDie("c_murmurhash", &g_ext->ch_mh_lb);
     LoadBalancerExtension()->RegisterOrDie("c_md5", &g_ext->ch_md5_lb);
@@ -363,25 +392,29 @@ static void GlobalInitializeOrDieImpl() {
     LoadBalancerExtension()->RegisterOrDie("_dynpart", &g_ext->dynpart_lb);
 
     // Compress Handlers
-    const CompressHandler gzip_compress =
-        { GzipCompress, GzipDecompress, "gzip" };
+    CompressHandler gzip_compress = { GzipCompress, GzipDecompress, "gzip" };
     if (RegisterCompressHandler(COMPRESS_TYPE_GZIP, gzip_compress) != 0) {
         exit(1);
     }
-    const CompressHandler zlib_compress =
-        { ZlibCompress, ZlibDecompress, "zlib" };
+    CompressHandler zlib_compress = { ZlibCompress, ZlibDecompress, "zlib" };
     if (RegisterCompressHandler(COMPRESS_TYPE_ZLIB, zlib_compress) != 0) {
         exit(1);
     }
-    const CompressHandler snappy_compress =
-        { SnappyCompress, SnappyDecompress, "snappy" };
+    CompressHandler snappy_compress = { SnappyCompress, SnappyDecompress, "snappy" };
     if (RegisterCompressHandler(COMPRESS_TYPE_SNAPPY, snappy_compress) != 0) {
+        exit(1);
+    }
+
+    // Checksum Handlers
+    const ChecksumHandler crc32c_checksum = {Crc32cCompute, Crc32cVerify,
+                                             "crc32c"};
+    if (RegisterChecksumHandler(CHECKSUM_TYPE_CRC32C, crc32c_checksum) != 0) {
         exit(1);
     }
 
     // Protocols
     Protocol baidu_protocol = { ParseRpcMessage,
-                                SerializeRequestDefault, PackRpcRequest,
+                                SerializeRpcRequest, PackRpcRequest,
                                 ProcessRpcRequest, ProcessRpcResponse,
                                 VerifyRpcRequest, NULL, NULL,
                                 CONNECTION_TYPE_ALL, "baidu_std" };
@@ -590,7 +623,8 @@ static void GlobalInitializeOrDieImpl() {
     // Concurrency Limiters
     ConcurrencyLimiterExtension()->RegisterOrDie("auto", &g_ext->auto_cl);
     ConcurrencyLimiterExtension()->RegisterOrDie("constant", &g_ext->constant_cl);
-    
+    ConcurrencyLimiterExtension()->RegisterOrDie("timeout", &g_ext->timeout_cl);
+
     if (FLAGS_usercode_in_pthread) {
         // Optional. If channel/server are initialized before main(), this
         // flag may be false at here even if it will be set to true after

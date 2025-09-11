@@ -16,8 +16,10 @@
 // under the License.
 
 
-#ifndef BRPC_HEALTH_CHECK_MANAGER_H
-#define BRPC_HEALTH_CHECK_MANAGER_H
+#ifndef BRPC_PERIODIC_TASK_H
+#define BRPC_PERIODIC_TASK_H
+
+#include <ctime>
 
 namespace brpc {
 
@@ -45,4 +47,4 @@ public:
 
 } // namespace brpc
 
-#endif  // BRPC_HEALTH_CHECK_MANAGER_H
+#endif  // BRPC_PERIODIC_TASK_H

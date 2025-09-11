@@ -2,7 +2,7 @@
 
 # 示例程序
 
-Echo的[client端代码](https://github.com/brpc/brpc/blob/master/example/echo_c++/client.cpp)。
+Echo的[client端代码](https://github.com/apache/brpc/blob/master/example/echo_c++/client.cpp)。
 
 # 事实速查
 
@@ -13,7 +13,7 @@ Echo的[client端代码](https://github.com/brpc/brpc/blob/master/example/echo_c
 - 没有brpc::Client这个类。
 
 # Channel
-Client指发起请求的一端，在brpc中没有对应的实体，取而代之的是[brpc::Channel](https://github.com/brpc/brpc/blob/master/src/brpc/channel.h)，它代表和一台或一组服务器的交互通道，Client和Channel在角色上的差别在实践中并不重要，你可以把Channel视作Client。
+Client指发起请求的一端，在brpc中没有对应的实体，取而代之的是[brpc::Channel](https://github.com/apache/brpc/blob/master/src/brpc/channel.h)，它代表和一台或一组服务器的交互通道，Client和Channel在角色上的差别在实践中并不重要，你可以把Channel视作Client。
 
 Channel可以**被所有线程共用**，你不需要为每个线程创建独立的Channel，也不需要用锁互斥。不过Channel的创建和Init并不是线程安全的，请确保在Init成功后再被多线程访问，在没有线程访问后再析构。
 
@@ -48,10 +48,14 @@ int Init(const char* server_addr, int port, const ChannelOptions* options);
 - 127.0.0.1:80
 - www.foo.com:8765
 - localhost:9000
+- [::1]:8080      # IPV6
+- unix:path.sock  # Unix domain socket
 
 不合法的"server_addr_and_port"：
 - 127.0.0.1:90000     # 端口过大
 - 10.39.2.300:8000   # 非法的ip
+
+关于IPV6和Unix domain socket的使用，详见 [EndPoint](endpoint.md)。
 
 # 连接服务集群
 
@@ -93,10 +97,10 @@ BNS是百度内常用的命名服务，比如bns://rdev.matrix.all，其中"bns"
  * 当文件更新时, brpc会重新加载。
 ```
 # 此行会被忽略
-10.24.234.17 tag1  # 这是注释，会被忽略
-10.24.234.17 tag2  # 此行和上一行被认为是不同的实例
-10.24.234.18
-10.24.234.19
+10.24.234.17:8080 tag1  # 这是注释，会被忽略
+10.24.234.17:8090 tag2  # 此行和上一行被认为是不同的实例
+10.24.234.18:8080
+10.24.234.19:8080
 ```
 
 优点: 易于修改，方便单测。
@@ -137,8 +141,34 @@ BNS是百度内常用的命名服务，比如bns://rdev.matrix.all，其中"bns"
 
 如果consul不可访问，服务可自动降级到file naming service获取服务列表。此功能默认关闭，可通过设置-consul\_enable\_degrade\_to\_file\_naming\_service来打开。服务列表文件目录通过-consul \_file\_naming\_service\_dir来设置，使用service-name作为文件名。该文件可通过consul-template生成，里面会保存consul不可用之前最新的下游服务节点。当consul恢复时可自动恢复到consul naming service。
 
+
+### nacos://\<service-name\>
+
+NacosNamingService使用[Open-Api](https://nacos.io/zh-cn/docs/open-api.html)定时从nacos获取服务列表。
+NacosNamingService支持[简单鉴权](https://nacos.io/zh-cn/docs/auth.html)。
+
+`<service-name>`是一个http uri query，具体参数参见`/nacos/v1/ns/instance/list`文档。
+注意：`<service-name>`需要urlencode。
+```
+nacos://serviceName=test&groupName=g&namespaceId=n&clusters=c&healthyOnly=true
+```
+
+NacosNamingService拉取列表的时间间隔为`/nacos/v1/ns/instance/list`api返回的`cacheMillis`。
+NacosNamingService只支持整形的权重值。
+
+| GFlags                             | 描述                       | 默认值                       |
+| ---------------------------------- | -------------------------- | ---------------------------- |
+| nacos_address                      | nacos http url             | ""                           |
+| nacos_service_discovery_path       | nacos服务发现路径          | "/nacos/v1/ns/instance/list" |
+| nacos_service_auth_path            | nacos登陆路径              | "/nacos/v1/auth/login"       |
+| nacos_service_timeout_ms           | 连接nacos超时时间（毫秒）  | 200                          |
+| nacos_username                     | 用户名（urlencode编码）    | ""                           |
+| nacos_password                     | 密码（urlencode编码）      | ""                           |
+| nacos_load_balancer                | nacos集群的负载均衡        | "rr"                         |
+
+
 ### 更多命名服务
-用户可以通过实现brpc::NamingService来对接更多命名服务，具体见[这里](https://github.com/brpc/brpc/blob/master/docs/cn/load_balancing.md#%E5%91%BD%E5%90%8D%E6%9C%8D%E5%8A%A1)
+用户可以通过实现brpc::NamingService来对接更多命名服务，具体见[这里](https://github.com/apache/brpc/blob/master/docs/cn/load_balancing.md#%E5%91%BD%E5%90%8D%E6%9C%8D%E5%8A%A1)
 
 ### 命名服务中的tag
 每个地址可以附带一个tag，在常见的命名服务中，如果地址后有空格，则空格之后的内容均为tag。
@@ -214,9 +244,17 @@ int main() {
 
 即weighted round robin, 根据服务器列表配置的权重值来选择服务器。服务器被选到的机会正比于其权重值，并且该算法能保证同一服务器被选到的结果较均衡的散开。
 
+实例的tag需要是表示权值的int32数字，如tag="50"。
+
 ### random
 
 随机从列表中选择一台服务器，无需其他设置。和round robin类似，这个算法的前提也是服务器都是类似的。
+
+### wr
+
+即weighted random, 根据服务器列表配置的权重值来选择服务器，服务器被选到的机会正比于其权重值。
+
+实例tag的要求同wrr。
 
 ### la
 
@@ -228,11 +266,13 @@ locality-aware，优先选择延时低的下游，直到其延时高于其他机
 
 发起RPC前需要设置Controller.set_request_code()，否则RPC会失败。request_code一般是请求中主键部分的32位哈希值，**不需要和负载均衡使用的哈希算法一致**。比如用c_murmurhash算法也可以用md5计算哈希值。
 
-[src/brpc/policy/hasher.h](https://github.com/brpc/brpc/blob/master/src/brpc/policy/hasher.h)中包含了常用的hash函数。如果用std::string key代表请求的主键，controller.set_request_code(brpc::policy::MurmurHash32(key.data(), key.size()))就正确地设置了request_code。
+[src/brpc/policy/hasher.h](https://github.com/apache/brpc/blob/master/src/brpc/policy/hasher.h)中包含了常用的hash函数。如果用std::string key代表请求的主键，controller.set_request_code(brpc::policy::MurmurHash32(key.data(), key.size()))就正确地设置了request_code。
 
 注意甄别请求中的“主键”部分和“属性”部分，不要为了偷懒或通用，就把请求的所有内容一股脑儿计算出哈希值，属性的变化会使请求的目的地发生剧烈的变化。另外也要注意padding问题，比如struct Foo { int32_t a; int64_t b; }在64位机器上a和b之间有4个字节的空隙，内容未定义，如果像hash(&foo, sizeof(foo))这样计算哈希值，结果就是未定义的，得把内容紧密排列或序列化后再算。
 
 实现原理请查看[Consistent Hashing](consistent_hashing.md)。
+
+其他lb不需要设置Controller.set_request_code()，如果调用了request_code也不会被lb使用，例如：lb=rr调用了Controller.set_request_code()，即使所有RPC的request_code都相同，也依然是rr。
 
 ### 从集群宕机后恢复时的客户端限流
 
@@ -251,7 +291,7 @@ channel.Init("http://...", "random:min_working_instances=6 hold_seconds=10", &op
 | ------------------------- | ----- | ---------------------------------------- | ----------------------- |
 | health_check_interval （R） | 3     | seconds between consecutive health-checkings | src/brpc/socket_map.cpp |
 
-在默认的配置下，一旦server被连接上，它会恢复为可用状态；brpc还提供了应用层健康检查的机制，框架会发送一个HTTP GET请求到该server，请求路径通过-health\_check\_path设置（默认为空），只有当server返回200时，它才会恢复。在两种健康检查机制下，都可通过-health\_check\_timeout\_ms设置超时（默认500ms）。如果在隔离过程中，server从命名服务中删除了，brpc也会停止连接尝试。
+在默认的配置下，一旦server被连接上，它会恢复为可用状态,可通过-health\_check\_timeout\_ms设置超时（默认500ms）；brpc还提供了应用层健康检查的机制，框架会发送一个HTTP GET请求到该server，只有当server返回200时，它才会恢复，在这种机制下，既可通过-health\_check\_path（默认为空）和-health\_check\_timeout\_ms（默认500ms）分别设置全局的健康检查请求路径和超时，也可通过ChannelOptions中的hc_option成员变量来对不同的channel设置不同的请求路径和超时，ChannelOptions设置的健康检查参数优先级要高于gflag参数。如果在隔离过程中，server从命名服务中删除了，brpc也会停止连接尝试。
 
 # 发起访问
 
@@ -287,6 +327,12 @@ if (cntl->Failed()) {
 }
 ```
 
+> 警告: 请勿在持有pthread锁的情况下，调用brpc的同步CallMethod！否则很容易导致死锁。
+> 
+> 解决方案（二选一）：
+> 1. 将pthread锁换成bthread锁(bthread_mutex_t）
+> 1. 在CallMethod之前将锁释放
+
 ## 异步访问
 
 指的是：给CallMethod传递一个额外的回调对象done，CallMethod在发出request后就结束了，而不是在RPC结束后。当server端返回response或发生错误（包括超时）时，done->Run()会被调用。对RPC的后续处理应该写在done->Run()里，而不是CallMethod后。
@@ -295,7 +341,11 @@ if (cntl->Failed()) {
 
 你可以独立地创建这些对象，并使用[NewCallback](#使用NewCallback)生成done，也可以把Response和Controller作为done的成员变量，[一起new出来](#继承google::protobuf::Closure)，一般使用前一种方法。
 
-**发起异步请求后Request和Channel也可以立刻析构**。这两样和response/controller是不同的。注意:这是说Channel的析构可以立刻发生在CallMethod**之后**，并不是说析构可以和CallMethod同时发生，删除正被另一个线程使用的Channel是未定义行为（很可能crash）。
+发起异步请求后Request可以立刻析构。(SelectiveChannel是个例外，SelectiveChannel情况下必须在请求处理完成后再释放request对象）
+
+发起异步请求后Channel可以立刻析构。
+
+注意:这是说Request/Channel的析构可以立刻发生在CallMethod**之后**，并不是说析构可以和CallMethod同时发生，删除正被另一个线程使用的Channel是未定义行为（很可能crash）。
 
 ### 使用NewCallback
 ```c++
@@ -318,9 +368,9 @@ MyService_Stub stub(&channel);
 MyRequest request;  // 你不用new request,即使在异步访问中.
 request.set_foo(...);
 cntl->set_timeout_ms(...);
-stub.some_method(cntl, &request, response, google::protobuf::NewCallback(OnRPCDone, response, cntl));
+stub.some_method(cntl, &request, response, brpc::NewCallback(OnRPCDone, response, cntl));
 ```
-由于protobuf 3把NewCallback设置为私有，r32035后brpc把NewCallback独立于[src/brpc/callback.h](https://github.com/brpc/brpc/blob/master/src/brpc/callback.h)（并增加了一些重载）。如果你的程序出现NewCallback相关的编译错误，把google::protobuf::NewCallback替换为brpc::NewCallback就行了。
+由于protobuf 3把NewCallback设置为私有，r32035后brpc把NewCallback独立于[src/brpc/callback.h](https://github.com/apache/brpc/blob/master/src/brpc/callback.h)（并增加了一些重载）。如果你的程序出现NewCallback相关的编译错误，把google::protobuf::NewCallback替换为brpc::NewCallback就行了。
 
 ### 继承google::protobuf::Closure
 
@@ -441,7 +491,7 @@ brpc::StartCancel(call_id)可取消对应的RPC，call_id必须**在发起RPC前
 
 ## 获取Server的地址和端口
 
-remote_side()方法可知道request被送向了哪个server，返回值类型是[butil::EndPoint](https://github.com/brpc/brpc/blob/master/src/butil/endpoint.h)，包含一个ip4地址和端口。在RPC结束前调用这个方法都是没有意义的。
+remote_side()方法可知道request被送向了哪个server，返回值类型是[butil::EndPoint](https://github.com/apache/brpc/blob/master/src/butil/endpoint.h)，包含一个ip4地址和端口。在RPC结束前调用这个方法都是没有意义的。
 
 打印方式：
 ```c++
@@ -484,8 +534,8 @@ for (int i = 0; i < n; ++i) {
 
 Client端的设置主要由三部分组成：
 
-- brpc::ChannelOptions: 定义在[src/brpc/channel.h](https://github.com/brpc/brpc/blob/master/src/brpc/channel.h)中，用于初始化Channel，一旦初始化成功无法修改。
-- brpc::Controller: 定义在[src/brpc/controller.h](https://github.com/brpc/brpc/blob/master/src/brpc/controller.h)中，用于在某次RPC中覆盖ChannelOptions中的选项，可根据上下文每次均不同。
+- brpc::ChannelOptions: 定义在[src/brpc/channel.h](https://github.com/apache/brpc/blob/master/src/brpc/channel.h)中，用于初始化Channel，一旦初始化成功无法修改。
+- brpc::Controller: 定义在[src/brpc/controller.h](https://github.com/apache/brpc/blob/master/src/brpc/controller.h)中，用于在某次RPC中覆盖ChannelOptions中的选项，可根据上下文每次均不同。
 - 全局gflags：常用于调节一些底层代码的行为，一般不用修改。请自行阅读服务[/flags页面](flags.md)中的说明。
 
 Controller包含了request中没有的数据和选项。server端和client端的Controller结构体是一样的，但使用的字段可能是不同的，你需要仔细阅读Controller中的注释，明确哪些字段可以在server端使用，哪些可以在client端使用。
@@ -501,7 +551,7 @@ Controller的特点：
 
 ## 线程数
 
-和大部分的RPC框架不同，brpc中并没有独立的Client线程池。所有Channel和Server通过[bthread](http://wiki.baidu.com/display/RPC/bthread)共享相同的线程池. 如果你的程序同样使用了brpc的server, 仅仅需要设置Server的线程数。 或者可以通过[gflags](http://wiki.baidu.com/display/RPC/flags)设置[-bthread_concurrency](http://brpc.baidu.com:8765/flags/bthread_concurrency)来设置全局的线程数.
+和大部分的RPC框架不同，brpc中并没有独立的Client线程池。所有Channel和Server通过[bthread](bthread.md)共享相同的线程池. 如果你的程序同样使用了brpc的server, 仅仅需要设置Server的线程数。 或者可以通过[gflags](flags.md)设置[-bthread_concurrency](http://brpc.baidu.com:8765/flags/bthread_concurrency)来设置全局的线程数.
 
 ## 超时
 
@@ -515,7 +565,7 @@ Controller的特点：
 
 ## 重试
 
-ChannelOptions.max_retry是该Channel上所有RPC的默认最大重试次数，Controller.set_max_retry()可修改某次RPC的值，默认值3，0表示不重试。
+ChannelOptions.max_retry是该Channel上所有RPC的默认最大重试次数，默认值3，0表示不重试。Controller.set_max_retry()可修改某次RPC的值。
 
 r32111后Controller.retried_count()返回重试次数。
 
@@ -534,10 +584,6 @@ r34717后Controller.has_backup_request()获知是否发送过backup_request。
 
 如果server一直没有返回，但连接没有问题，这种情况下不会重试。如果你需要在一定时间后发送另一个请求，使用backup request。
 
-工作机制如下：如果response没有在backup_request_ms内返回，则发送另外一个请求，哪个先回来就取哪个。新请求会被尽量送到不同的server。注意如果backup_request_ms大于超时，则backup request总不会被发送。backup request会消耗一次重试次数。backup request不意味着server端cancel。
-
-ChannelOptions.backup_request_ms影响该Channel上所有RPC，单位毫秒，默认值-1（表示不开启），Controller.set_backup_request_ms()可修改某次RPC的值。
-
 ### 没到超时
 
 超时后RPC会尽快结束。
@@ -550,7 +596,7 @@ Controller.set_max_retry(0)或ChannelOptions.max_retry=0关闭重试。
 
 一些错误重试是没有意义的，就不会重试，比如请求有错时(EREQUEST)不会重试，因为server总不会接受,没有意义。
 
-用户可以通过继承[brpc::RetryPolicy](https://github.com/brpc/brpc/blob/master/src/brpc/retry_policy.h)自定义重试条件。比如brpc默认不重试http/h2相关的错误，而你的程序中希望在碰到HTTP_STATUS_FORBIDDEN (403)时重试，可以这么做：
+用户可以通过继承[brpc::RetryPolicy](https://github.com/apache/brpc/blob/master/src/brpc/retry_policy.h)自定义重试条件。比如brpc默认不重试http/h2相关的错误，而你的程序中希望在碰到HTTP_STATUS_FORBIDDEN (403)时重试，可以这么做：
 
 ```c++
 #include <brpc/retry_policy.h>
@@ -580,6 +626,112 @@ options.retry_policy = &g_my_retry_policy;
 
 * 通过cntl->response()可获得对应RPC的response。
 * 对ERPCTIMEDOUT代表的RPC超时总是不重试，即使你继承的RetryPolicy中允许。
+
+
+### 重试退避
+
+对于一些暂时性的错误，如网络抖动等，等待一小会儿再重试的成功率比立即重试的成功率高，同时可以打散上游重试的时机，减轻服务端压力，避免重试风暴导致服务端出现瞬间流量洪峰。
+
+框架支持两种重试退避策略：固定时间间隔退避策略和随机时间间隔退避策略。
+
+固定时间间隔退避策略需要设置固定时间间隔（毫秒）、无需重试退避的剩余rpc时间阈值（毫秒，当剩余rpc时间小于阈值，则不进行重试退避）、是否允许在pthread进行重试退避。使用方法如下：
+
+```c++
+// 给ChannelOptions.retry_policy赋值就行了。
+// 注意：retry_policy必须在Channel使用期间保持有效，Channel也不会删除retry_policy，所以大部分情况下RetryPolicy都应以单例模式创建。
+brpc::ChannelOptions options;
+int32_t fixed_backoff_time_ms = 100; // 固定时间间隔（毫秒）
+int32_t no_backoff_remaining_rpc_time_ms = 150; // 无需重试退避的剩余rpc时间阈值（毫秒）
+bool retry_backoff_in_pthread = false;
+static brpc::RpcRetryPolicyWithFixedBackoff g_retry_policy_with_fixed_backoff(
+        fixed_backoff_time_ms, no_backoff_remaining_rpc_time_ms, retry_backoff_in_pthread);
+options.retry_policy = &g_retry_policy_with_fixed_backoff;
+...
+```
+
+随机时间间隔退避策略需要设置最小时间间隔（毫秒）、最大时间间隔（毫秒）、无需重试退避的剩余rpc时间阈值（毫秒，当剩余rpc时间小于阈值，则不进行重试退避）、是否允许在pthread做重试退避。每次策略会随机生成一个在最小时间间隔和最大时间间隔之间的重试退避间隔。使用方法如下：
+
+```c++
+// 给ChannelOptions.retry_policy赋值就行了。
+// 注意：retry_policy必须在Channel使用期间保持有效，Channel也不会删除retry_policy，所以大部分情况下RetryPolicy都应以单例模式创建。
+brpc::ChannelOptions options;
+int32_t min_backoff_time_ms = 100; // 最小时间间隔（毫秒）
+int32_t max_backoff_time_ms = 200; // 最大时间间隔（毫秒）
+int32_t no_backoff_remaining_rpc_time_ms = 150; // 无需重试退避的剩余rpc时间阈值（毫秒）
+bool retry_backoff_in_pthread = false; // 是否允许在pthread做重试退避
+static brpc::RpcRetryPolicyWithJitteredBackoff g_retry_policy_with_jitter_backoff(
+        min_backoff_time_ms, max_backoff_time_ms, 
+        no_backoff_remaining_rpc_time_ms, retry_backoff_in_pthread);
+options.retry_policy = &g_retry_policy_with_jitter_backoff;
+...
+```
+
+用户可以通过继承[brpc::RetryPolicy](https://github.com/apache/brpc/blob/master/src/brpc/retry_policy.h)自定义重试退避策略。比如只需要针对服务端并发数超限的情况进行重试退避，可以这么做：
+
+```c++
+class MyRetryPolicy : public brpc::RetryPolicy {
+public:
+    bool DoRetry(const brpc::Controller* cntl) const {
+        // 同《错误值得重试》一节
+    }
+    
+    int32_t GetBackoffTimeMs(const brpc::Controller* cntl) const {
+        if (controller->ErrorCode() == brpc::ELIMIT) {
+            return 100; // 退避100毫秒
+        }
+        return 0; // 返回0表示不进行重试退避。
+    }
+    
+    bool CanRetryBackoffInPthread() const {
+        return true;
+    }
+};
+...
+
+// 给ChannelOptions.retry_policy赋值就行了。
+// 注意：retry_policy必须在Channel使用期间保持有效，Channel也不会删除retry_policy，所以大部分情况下RetryPolicy都应以单例模式创建。
+brpc::ChannelOptions options;
+static MyRetryPolicy g_my_retry_policy;
+options.retry_policy = &g_my_retry_policy;
+...
+```
+
+如果用户希望使用框架默认的DoRetry，只实现自定义的重试退避策略，则可以继承[brpc::RpcRetryPolicy](https://github.com/apache/brpc/blob/master/src/brpc/retry_policy.h)。
+
+一些提示：
+
+- 当策略返回的重试退避时间大于等于剩余的rpc时间或者等于0，框架不会进行重试退避，而是立即进行重试。
+- [brpc::RpcRetryPolicyWithFixedBackoff](https://github.com/apache/brpc/blob/master/src/brpc/retry_policy.h)（固定时间间隔退策略）和[brpc::RpcRetryPolicyWithJitteredBackoff](https://github.com/apache/brpc/blob/master/src/brpc/retry_policy.h)（随机时间间隔退策略）继承了[brpc::RpcRetryPolicy](https://github.com/apache/brpc/blob/master/src/brpc/retry_policy.h)，使用框架默认的DoRetry。
+- 在pthread中进行重试退避（实际上通过bthread_usleep实现）会阻塞pthread，所以默认不会在pthread上进行重试退避。
+
+### backup request
+
+工作机制如下：如果response没有在backup_request_ms内返回，则发送另外一个请求，哪个先回来就取哪个。新请求会被尽量送到不同的server。注意如果backup_request_ms大于超时，则backup request总不会被发送。backup request会消耗一次重试次数。backup request不意味着server端cancel。
+
+ChannelOptions.backup_request_ms影响该Channel上所有RPC，单位毫秒，默认值-1（表示不开启）。Controller.set_backup_request_ms()可修改某次RPC的值。
+
+用户可以通过继承[brpc::BackupRequestPolicy](https://github.com/apache/brpc/blob/master/src/brpc/backup_request_policy.h)自定义策略（backup_request_ms和熔断backup request）。 比如根据延时调节backup_request_ms或者根据错误率熔断部分backup request。
+
+ChannelOptions.backup_request_policy同样影响该Channel上所有RPC。Controller.set_backup_request_policy()可修改某次RPC的策略。backup_request_policy优先级高于backup_request_ms。
+
+brpc::BackupRequestPolicy接口如下：
+
+```c++
+class BackupRequestPolicy {
+public:
+    virtual ~BackupRequestPolicy() = default;
+
+    // Return the time in milliseconds in which another request
+    // will be sent if RPC does not finish.
+    virtual int32_t GetBackupRequestMs(const Controller* controller) const = 0;
+
+    // Return true if the backup request should be sent.
+    virtual bool DoBackup(const Controller* controller) const = 0;
+    
+    // Called  when a rpc is end, user can collect call information to adjust policy.
+    virtual void OnRPCEnd(const Controller* controller) = 0;
+};
+```
 
 ### 重试应当保守
 
@@ -695,7 +847,7 @@ baidu_std和hulu_pbrpc协议支持附件，这段数据由用户自定义，不�
 ## 开启SSL
 
 要开启SSL，首先确保代码依赖了最新的openssl库。如果openssl版本很旧，会有严重的安全漏洞，支持的加密算法也少，违背了开启SSL的初衷。
-然后设置`ChannelOptions.mutable_ssl_options()`，具体选项见[ssl_options.h](https://github.com/brpc/brpc/blob/master/src/brpc/ssl_options.h)。ChannelOptions.has_ssl_options()可查询是否设置过ssl_options, ChannelOptions.ssl_options()可访问到设置过的只读ssl_options。
+然后设置`ChannelOptions.mutable_ssl_options()`，具体选项见[ssl_options.h](https://github.com/apache/brpc/blob/master/src/brpc/ssl_options.h)。ChannelOptions.has_ssl_options()可查询是否设置过ssl_options, ChannelOptions.ssl_options()可访问到设置过的只读ssl_options。
 
 ```c++
 // 开启客户端SSL并使用默认值。
@@ -704,10 +856,13 @@ options.mutable_ssl_options();
 // 开启客户端SSL并定制选项。
 options.mutable_ssl_options()->ciphers_name = "...";
 options.mutable_ssl_options()->sni_name = "...";
+
+// 设置 ALPN 的协议优先级（默认不启用 ALPN）。
+options.mutable_ssl_options()->alpn_protocols = {"h2", "http/1.1"};
 ```
 - 连接单点和集群的Channel均可以开启SSL访问（初始实现曾不支持集群）。
 - 开启后，该Channel上任何协议的请求，都会被SSL加密后发送。如果希望某些请求不加密，需要额外再创建一个Channel。
-- 针对HTTPS做了些易用性优化：Channel.Init能自动识别https://前缀并自动开启SSL；开启-http_verbose也会输出证书信息。
+- 针对HTTPS做了些易用性优化：Channel.Init能自动识别`https://`前缀并自动开启SSL；开启-http_verbose也会输出证书信息。
 
 ## 认证
 
@@ -747,11 +902,11 @@ set_request_compress_type()设置request的压缩方式，默认不压缩。
 
 注意：附件不会被压缩。
 
-http/h2 body的压缩方法见[client压缩request body](http_client#压缩request-body)。
+http/h2 body的压缩方法见[client压缩request body](http_client.md#压缩request-body)。
 
 支持的压缩方法有：
 
-- brpc::CompressTypeSnappy : [snanpy压缩](http://google.github.io/snappy/)，压缩和解压显著快于其他压缩方法，但压缩率最低。
+- brpc::CompressTypeSnappy : [snappy压缩](http://google.github.io/snappy/)，压缩和解压显著快于其他压缩方法，但压缩率最低。
 - brpc::CompressTypeGzip : [gzip压缩](http://en.wikipedia.org/wiki/Gzip)，显著慢于snappy，但压缩率高
 - brpc::CompressTypeZlib : [zlib压缩](http://en.wikipedia.org/wiki/Zlib)，比gzip快10%~20%，压缩率略好于gzip，但速度仍明显慢于snappy。
 
@@ -793,7 +948,7 @@ http/h2 body的压缩方法见[client压缩request body](http_client#压缩reque
 
 ### Q: brpc能用unix domain socket吗
 
-不能。同机TCP socket并不走网络，相比unix domain socket性能只会略微下降。一些不能用TCP socket的特殊场景可能会需要，以后可能会扩展支持。
+支持，参考 [EndPoint](endpoint.md).
 
 ### Q: Fail to connect to xx.xx.xx.xx:xxxx, Connection refused
 
@@ -853,11 +1008,11 @@ FATAL 04-07 20:00:03 7778 src/brpc/channel.cpp:123] Invalid address=`bns://group
 
 主要步骤：
 
-1. 创建一个[bthread_id](https://github.com/brpc/brpc/blob/master/src/bthread/id.h)作为本次RPC的correlation_id。
-2. 根据Channel的创建方式，从进程级的[SocketMap](https://github.com/brpc/brpc/blob/master/src/brpc/socket_map.h)中或从[LoadBalancer](https://github.com/brpc/brpc/blob/master/src/brpc/load_balancer.h)中选择一台下游server作为本次RPC发送的目的地。
-3. 根据连接方式（单连接、连接池、短连接），选择一个[Socket](https://github.com/brpc/brpc/blob/master/src/brpc/socket.h)。
+1. 创建一个[bthread_id](https://github.com/apache/brpc/blob/master/src/bthread/id.h)作为本次RPC的correlation_id。
+2. 根据Channel的创建方式，从进程级的[SocketMap](https://github.com/apache/brpc/blob/master/src/brpc/socket_map.h)中或从[LoadBalancer](https://github.com/apache/brpc/blob/master/src/brpc/load_balancer.h)中选择一台下游server作为本次RPC发送的目的地。
+3. 根据连接方式（单连接、连接池、短连接），选择一个[Socket](https://github.com/apache/brpc/blob/master/src/brpc/socket.h)。
 4. 如果开启验证且当前Socket没有被验证过时，第一个请求进入验证分支，其余请求会阻塞直到第一个包含认证信息的请求写入Socket。server端只对第一个请求进行验证。
-5. 根据Channel的协议，选择对应的序列化函数把request序列化至[IOBuf](https://github.com/brpc/brpc/blob/master/src/butil/iobuf.h)。
+5. 根据Channel的协议，选择对应的序列化函数把request序列化至[IOBuf](https://github.com/apache/brpc/blob/master/src/butil/iobuf.h)。
 6. 如果配置了超时，设置定时器。从这个点开始要避免使用Controller对象，因为在设定定时器后随时可能触发超时->调用到用户的超时回调->用户在回调中析构Controller。
 7. 发送准备阶段结束，若上述任何步骤出错，会调用Channel::HandleSendFailed。
 8. 将之前序列化好的IOBuf写出到Socket上，同时传入回调Channel::HandleSocketFailed，当连接断开、写失败等错误发生时会调用此回调。

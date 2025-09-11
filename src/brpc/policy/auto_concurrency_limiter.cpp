@@ -93,7 +93,7 @@ AutoConcurrencyLimiter* AutoConcurrencyLimiter::New(const AdaptiveMaxConcurrency
     return new (std::nothrow) AutoConcurrencyLimiter;
 }
 
-bool AutoConcurrencyLimiter::OnRequested(int current_concurrency) {
+bool AutoConcurrencyLimiter::OnRequested(int current_concurrency, Controller*) {
     return current_concurrency <= _max_concurrency;
 }
 
@@ -132,6 +132,10 @@ void AutoConcurrencyLimiter::OnResponded(int error_code, int64_t latency_us) {
 
 int AutoConcurrencyLimiter::MaxConcurrency() {
     return _max_concurrency;
+}
+
+int AutoConcurrencyLimiter::ResetMaxConcurrency(const AdaptiveMaxConcurrency&) {
+    return -1;
 }
 
 int64_t AutoConcurrencyLimiter::NextResetTime(int64_t sampling_time_us) {

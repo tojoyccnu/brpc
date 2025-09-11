@@ -31,14 +31,6 @@ namespace brpc {
 // Declared at socket.cpp
 extern SocketVarsCollector* g_vars;
 
-DEFINE_string(health_check_path, "", "Http path of health check call."
-        "By default health check succeeds if the server is connectable."
-        "If this flag is set, health check is not completed until a http "
-        "call to the path succeeds within -health_check_timeout_ms(to make "
-        "sure the server functions well).");
-DEFINE_int32(health_check_timeout_ms, 500, "The timeout for both establishing "
-        "the connection and the http call to -health_check_path over the connection");
-
 class HealthCheckChannel : public brpc::Channel {
 public:
     HealthCheckChannel() {}
@@ -65,6 +57,7 @@ public:
     SocketId id;
     int64_t interval_s;
     int64_t last_check_time_ms;
+    HealthCheckOption hc_option;
 };
 
 class HealthCheckManager {
@@ -81,15 +74,16 @@ void HealthCheckManager::StartCheck(SocketId id, int64_t check_interval_s) {
                  << " was abandoned during health checking";
         return;
     }
-    LOG(INFO) << "Checking path=" << ptr->remote_side() << FLAGS_health_check_path;
+    LOG(INFO) << "Checking path=" << ptr->remote_side() << ptr->health_check_path();
     OnAppHealthCheckDone* done = new OnAppHealthCheckDone;
     done->id = id;
     done->interval_s = check_interval_s;
+    done->hc_option = ptr->_hc_option;
     brpc::ChannelOptions options;
     options.protocol = PROTOCOL_HTTP;
     options.max_retry = 0;
     options.timeout_ms =
-        std::min((int64_t)FLAGS_health_check_timeout_ms, check_interval_s * 1000);
+        std::min((int64_t)(done->hc_option.health_check_timeout_ms), check_interval_s * 1000);
     if (done->channel.Init(id, &options) != 0) {
         LOG(WARNING) << "Fail to init health check channel to SocketId=" << id;
         ptr->_ninflight_app_health_check.fetch_sub(
@@ -103,7 +97,7 @@ void HealthCheckManager::StartCheck(SocketId id, int64_t check_interval_s) {
 void* HealthCheckManager::AppCheck(void* arg) {
     OnAppHealthCheckDone* done = static_cast<OnAppHealthCheckDone*>(arg);
     done->cntl.Reset();
-    done->cntl.http_request().uri() = FLAGS_health_check_path;
+    done->cntl.http_request().uri() = done->hc_option.health_check_path;
     ControllerPrivateAccessor(&done->cntl).set_health_check_call();
     done->last_check_time_ms = butil::gettimeofday_ms();
     done->channel.CallMethod(NULL, &done->cntl, NULL, NULL, done);
@@ -121,14 +115,14 @@ void OnAppHealthCheckDone::Run() {
     }
     if (!cntl.Failed() || ptr->Failed()) {
         LOG_IF(INFO, !cntl.Failed()) << "Succeeded to call "
-            << ptr->remote_side() << FLAGS_health_check_path;
+            << ptr->remote_side() << hc_option.health_check_path;
         // if ptr->Failed(), previous SetFailed would trigger next round
         // of hc, just return here.
         ptr->_ninflight_app_health_check.fetch_sub(
                     1, butil::memory_order_relaxed);
         return;
     }
-    RPC_VLOG << "Fail to check path=" << FLAGS_health_check_path
+    RPC_VLOG << "Fail to check path=" << hc_option.health_check_path
         << ", " << cntl.ErrorText();
 
     int64_t sleep_time_ms =
@@ -167,7 +161,7 @@ bool HealthCheckTask::OnTriggeringTask(timespec* next_abstime) {
                  << " was abandoned before health checking";
         return false;
     }
-    // Note: Making a Socket re-addessable is hard. An alternative is
+    // Note: Making a Socket re-addressable is hard. An alternative is
     // creating another Socket with selected internal fields to replace
     // failed Socket. Although it avoids concurrent issues with in-place
     // revive, it changes SocketId: many code need to watch SocketId 
@@ -179,11 +173,12 @@ bool HealthCheckTask::OnTriggeringTask(timespec* next_abstime) {
     // one is addressing the Socket(except here). Because the Socket 
     // is not addressable, the reference count will not increase 
     // again. This solution is not perfect because the `expected_nref'
-    // is implementation specific. In our case, one reference comes 
-    // from SocketMapInsert(socket_map.cpp), one reference is here. 
-    // Although WaitAndReset() could hang when someone is addressing
-    // the failed Socket forever (also indicating bug), this is not an 
-    // issue in current code. 
+    // is implementation specific. In our case, one reference comes
+    // from someone who holds a reference related to health checking,
+    // e.g. SocketMapInsert(socket_map.cpp) or ChannelBalancer::AddChannel
+    // (selective_channel.cpp), one reference is here. Although WaitAndReset()
+    // could hang when someone is addressing the failed Socket forever
+    // (also indicating bug), this is not an issue in current code.
     if (_first_time) {  // Only check at first time.
         _first_time = false;
         if (ptr->WaitAndReset(2/*note*/) != 0) {
@@ -204,22 +199,24 @@ bool HealthCheckTask::OnTriggeringTask(timespec* next_abstime) {
         hc = ptr->CheckHealth();
     }
     if (hc == 0) {
-        if (ptr->CreatedByConnect()) {
-            g_vars->channel_conn << -1;
-        }
-        if (!FLAGS_health_check_path.empty()) {
+        if (!ptr->health_check_path().empty()) {
             ptr->_ninflight_app_health_check.fetch_add(
                     1, butil::memory_order_relaxed);
         }
-        ptr->Revive();
+        // See comments above.
+        ptr->Revive(2/*note*/);
         ptr->_hc_count = 0;
-        if (!FLAGS_health_check_path.empty()) {
+        if (!ptr->health_check_path().empty()) {
             HealthCheckManager::StartCheck(_id, ptr->_health_check_interval_s);
         }
         return false;
     } else if (hc == ESTOP) {
         LOG(INFO) << "Cancel checking " << *ptr;
         return false;
+    } else {
+        RPC_VLOG << "Fail to check " << *ptr
+                 << ", error code=" << errno
+                 << ": " << berror();
     }
     ++ ptr->_hc_count;
     *next_abstime = butil::seconds_from_now(ptr->_health_check_interval_s);

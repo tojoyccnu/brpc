@@ -32,6 +32,7 @@ struct ConnectStatistics {
 // Accept connections from a specific port and then
 // process messages from which it reads
 class Acceptor : public InputMessenger {
+friend class Server;
 public:
     typedef butil::FlatMap<SocketId, ConnectStatistics> SocketMap;
 
@@ -54,7 +55,8 @@ public:
     // `idle_timeout_sec' > 0
     // Return 0 on success, -1 otherwise.
     int StartAccept(int listened_fd, int idle_timeout_sec,
-                    const std::shared_ptr<SocketSSLContext>& ssl_ctx);
+                    const std::shared_ptr<SocketSSLContext>& ssl_ctx,
+                    bool force_ssl);
 
     // [thread-safe] Stop accepting connections.
     // `closewait_ms' is not used anymore.
@@ -105,7 +107,14 @@ private:
     // The map containing all the accepted sockets
     SocketMap _socket_map;
 
+    bool _force_ssl;
     std::shared_ptr<SocketSSLContext> _ssl_ctx;
+
+    // Whether to use rdma or not
+    bool _use_rdma;
+
+    // Acceptor belongs to this tag
+    bthread_tag_t _bthread_tag;
 };
 
 } // namespace brpc

@@ -129,7 +129,7 @@ private:
     const char* _stream;
 };
 
-inline void PackSofaHeader(char* sofa_header, int meta_size, int body_size) {
+inline void PackSofaHeader(char* sofa_header, uint32_t meta_size, int body_size) {
     uint32_t* dummy = reinterpret_cast<uint32_t*>(sofa_header); // suppress strict-alias warning
     *dummy = *reinterpret_cast<const uint32_t*>("SOFA");
 
@@ -139,7 +139,7 @@ inline void PackSofaHeader(char* sofa_header, int meta_size, int body_size) {
 
 static void SerializeSofaHeaderAndMeta(
     butil::IOBuf* out, const SofaRpcMeta& meta, int payload_size) {
-    const int meta_size = meta.ByteSize();
+    const uint32_t meta_size = GetProtobufByteSize(meta);
     if (meta_size <= 232) { // most common cases
         char header_and_meta[24 + meta_size];
         PackSofaHeader(header_and_meta, meta_size, payload_size);
@@ -281,8 +281,15 @@ static void SendSofaResponse(int64_t correlation_id,
     }
     // Have the risk of unlimited pending responses, in which case, tell
     // users to set max_concurrency.
+    ResponseWriteInfo args;
     Socket::WriteOptions wopt;
     wopt.ignore_eovercrowded = true;
+    bthread_id_t response_id = INVALID_BTHREAD_ID;
+    if (span) {
+        CHECK_EQ(0, bthread_id_create(&response_id, &args, HandleResponseWritten));
+        wopt.id_wait = response_id;
+        wopt.notify_on_success = true;
+    }
     if (sock->Write(&res_buf, &wopt) != 0) {
         const int errcode = errno;
         PLOG_IF(WARNING, errcode != EPIPE) << "Fail to write into " << *sock;
@@ -290,9 +297,12 @@ static void SendSofaResponse(int64_t correlation_id,
                         sock->description().c_str());
         return;
     }
+
     if (span) {
+        bthread_id_join(response_id);
+        // Do not care about the result of background writing.
         // TODO: this is not sent
-        span->set_sent_us(butil::cpuwide_time_us());
+        span->set_sent_us(args.sent_us);
     }
 }
 
@@ -381,12 +391,6 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
             break;
         }
 
-        if (socket->is_overcrowded()) {
-            cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
-                            butil::endpoint2str(socket->remote_side()).c_str());
-            break;
-        }
-
         if (!server_accessor.AddConcurrency(cntl.get())) {
             cntl->SetFailed(
                 ELIMIT, "Reached server's max_concurrency=%d",
@@ -406,6 +410,13 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
                             meta.method().c_str());
             break;
         }
+        if (socket->is_overcrowded() &&
+            !server->options().ignore_eovercrowded &&
+            !sp->ignore_eovercrowded) {
+            cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
+                            butil::endpoint2str(socket->remote_side()).c_str());
+            break;
+        }
         // Switch to service-specific error.
         non_service_error.release();
         method_status = sp->status;
@@ -420,6 +431,11 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
         google::protobuf::Service* svc = sp->service;
         const google::protobuf::MethodDescriptor* method = sp->method;
         accessor.set_method(method);
+
+        if (!server->AcceptRequest(cntl.get())) {
+            break;
+        }
+
         if (span) {
             span->ResetServerSpanName(method->full_name());
         }
@@ -441,7 +457,7 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
                     req.get(), res.get(), server,
                     method_status, msg->received_us());
 
-        msg.reset();  // optional, just release resourse ASAP
+        msg.reset();  // optional, just release resource ASAP
 
         // `cntl', `req' and `res' will be deleted inside `done'
         if (span) {
@@ -526,7 +542,7 @@ void ProcessSofaResponse(InputMessageBase* msg_base) {
 
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     accessor.OnResponse(cid, saved_error);
 }
 

@@ -16,6 +16,10 @@
 // under the License.
 
 
+#include <ctype.h>                         // isalnum
+
+#include <unordered_set>
+
 #include "brpc/log.h"
 #include "brpc/details/http_parser.h"      // http_parser_parse_url
 #include "brpc/uri.h"                      // URI
@@ -68,9 +72,6 @@ static void ParseQueries(URI::QueryMap& query_map, const std::string &query) {
     }
     for (QuerySplitter sp(query.c_str()); sp; ++sp) {
         if (!sp.key().empty()) {
-            if (!query_map.initialized()) {
-                query_map.init(URI::QUERY_MAP_INITIAL_BUCKET);
-            }
             std::string key(sp.key().data(), sp.key().size());
             std::string value(sp.value().data(), sp.value().size());
             query_map[key] = value;
@@ -96,6 +97,21 @@ inline const char* SplitHostAndPort(const char* host_begin,
     }
     *port = -1;
     return host_end;
+}
+
+// valid characters in URL
+// https://datatracker.ietf.org/doc/html/rfc3986#section-2.1
+// https://datatracker.ietf.org/doc/html/rfc3986#section-2.3
+// https://datatracker.ietf.org/doc/html/rfc3986#section-2.4
+// space is not allowed by rfc3986, but allowed by brpc
+static bool is_valid_char(char c) {
+    static const std::unordered_set<char> other_valid_char = {
+        ':', '/', '?', '#', '[', ']', '@', '!', '$', '&',
+        '\'', '(', ')', '*', '+', ',', ';', '=', '-', '.',
+        '_', '~', '%', ' '
+    };
+
+    return (isalnum(c) || other_valid_char.count(c));
 }
 
 static bool is_all_spaces(const char* p) {
@@ -159,7 +175,10 @@ int URI::SetHttpURL(const char* url) {
         if (action == URI_PARSE_BREAK) {
             break;
         }
-        if (*p == ':') {
+        if (!is_valid_char(*p)) {
+            _st.set_error(EINVAL, "invalid character in url");
+            return -1;
+        } else if (*p == ':') {
             if (p[1] == '/' && p[2] == '/' && need_scheme) {
                 need_scheme = false;
                 _scheme.assign(start, p - start);
@@ -325,9 +344,6 @@ void URI::PrintWithoutHost(std::ostream& os) const {
 }
 
 void URI::InitializeQueryMap() const {
-    if (!_query_map.initialized()) {
-        CHECK_EQ(0, _query_map.init(QUERY_MAP_INITIAL_BUCKET));
-    }
     ParseQueries(_query_map, _query);
     _query_was_modified = false;
     _initialized_query_map = true;

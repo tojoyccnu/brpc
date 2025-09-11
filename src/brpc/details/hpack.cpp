@@ -241,12 +241,10 @@ int IndexTable::Init(const IndexTableOptions& options) {
     _need_indexes = options.need_indexes;
     if (_need_indexes) {
         if (_name_index.init(num_headers * 2) != 0) {
-            LOG(ERROR) << "Fail to init _name_index";
-            return -1;
+            LOG(WARNING) << "Fail to init _name_index";
         }
         if (_header_index.init(num_headers * 2) != 0) {
-            LOG(ERROR) << "Fail to init _name_index";
-            return -1;
+            LOG(WARNING) << "Fail to init _name_index";
         }
     }
     if (options.static_table_size > 0) {
@@ -489,8 +487,7 @@ inline void EncodeInteger(butil::IOBufAppender* out, uint8_t msb,
     value -= max_prefix_value;
     msb |= max_prefix_value;
     out->push_back(msb);
-    size_t out_bytes = 1;
-    for (; value >= 128; ++out_bytes) {
+    for (; value >= 128; ) {
         const uint8_t c = (value & 0x7f) | 0x80;
         value >>= 7;
         out->push_back(c);

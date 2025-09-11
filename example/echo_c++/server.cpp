@@ -20,14 +20,16 @@
 #include <gflags/gflags.h>
 #include <butil/logging.h>
 #include <brpc/server.h>
+#include <json2pb/pb_to_json.h>
 #include "echo.pb.h"
 
 DEFINE_bool(echo_attachment, true, "Echo attachment as well");
 DEFINE_int32(port, 8000, "TCP Port of this server");
+DEFINE_string(listen_addr, "", "Server listen address, may be IPV4/IPV6/UDS."
+            " If this is set, the flag port will be ignored");
 DEFINE_int32(idle_timeout_s, -1, "Connection will be closed if there is no "
              "read/write operations during the last `idle_timeout_s'");
-DEFINE_int32(logoff_ms, 2000, "Maximum duration of server's LOGOFF state "
-             "(waiting for client to close connection before server stops)");
+DEFINE_bool(enable_checksum, false, "Enable checksum or not");
 
 // Your implementation of example::EchoService
 // Notice that implementing brpc::Describable grants the ability to put
@@ -35,8 +37,8 @@ DEFINE_int32(logoff_ms, 2000, "Maximum duration of server's LOGOFF state "
 namespace example {
 class EchoServiceImpl : public EchoService {
 public:
-    EchoServiceImpl() {};
-    virtual ~EchoServiceImpl() {};
+    EchoServiceImpl() {}
+    virtual ~EchoServiceImpl() {}
     virtual void Echo(google::protobuf::RpcController* cntl_base,
                       const EchoRequest* request,
                       EchoResponse* response,
@@ -47,6 +49,11 @@ public:
 
         brpc::Controller* cntl =
             static_cast<brpc::Controller*>(cntl_base);
+
+        // optional: set a callback function which is called after response is sent
+        // and before cntl/req/res is destructed.
+        cntl->set_after_rpc_resp_fn(std::bind(&EchoServiceImpl::CallAfterRpc,
+            std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 
         // The purpose of following logs is to help you to understand
         // how clients interact with servers more intuitively. You should 
@@ -69,13 +76,31 @@ public:
             // being serialized into protobuf messages.
             cntl->response_attachment().append(cntl->request_attachment());
         }
+
+        // Use checksum, only support CRC32C now.
+        if (FLAGS_enable_checksum) {
+            cntl->set_response_checksum_type(brpc::CHECKSUM_TYPE_CRC32C);
+        }
+    }
+
+    // optional
+    static void CallAfterRpc(brpc::Controller* cntl,
+                        const google::protobuf::Message* req,
+                        const google::protobuf::Message* res) {
+        // at this time res is already sent to client, but cntl/req/res is not destructed
+        std::string req_str;
+        std::string res_str;
+        json2pb::ProtoMessageToJson(*req, &req_str, NULL);
+        json2pb::ProtoMessageToJson(*res, &res_str, NULL);
+        LOG(INFO) << "req:" << req_str
+                    << " res:" << res_str;
     }
 };
 }  // namespace example
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     // Generally you only need one Server.
     brpc::Server server;
@@ -92,10 +117,19 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
+    butil::EndPoint point;
+    if (!FLAGS_listen_addr.empty()) {
+        if (butil::str2endpoint(FLAGS_listen_addr.c_str(), &point) < 0) {
+            LOG(ERROR) << "Invalid listen address:" << FLAGS_listen_addr;
+            return -1;
+        }
+    } else {
+        point = butil::EndPoint(butil::IP_ANY, FLAGS_port);
+    }
     // Start the server.
     brpc::ServerOptions options;
     options.idle_timeout_sec = FLAGS_idle_timeout_s;
-    if (server.Start(FLAGS_port, &options) != 0) {
+    if (server.Start(point, &options) != 0) {
         LOG(ERROR) << "Fail to start EchoServer";
         return -1;
     }

@@ -26,14 +26,12 @@
 DEFINE_int32(port, 50051, "TCP Port of this server");
 DEFINE_int32(idle_timeout_s, -1, "Connection will be closed if there is no "
              "read/write operations during the last `idle_timeout_s'");
-DEFINE_int32(logoff_ms, 2000, "Maximum duration of server's LOGOFF state "
-             "(waiting for client to close connection before server stops)");
 DEFINE_bool(gzip, false, "compress body using gzip");
 
 class GreeterImpl : public helloworld::Greeter {
 public:
-    GreeterImpl() {};
-    virtual ~GreeterImpl() {};
+    GreeterImpl() {}
+    virtual ~GreeterImpl() {}
     void SayHello(google::protobuf::RpcController* cntl_base,
                  const helloworld::HelloRequest* req,
                  helloworld::HelloReply* res,
@@ -49,7 +47,7 @@ public:
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     // Generally you only need one Server.
     brpc::Server server;

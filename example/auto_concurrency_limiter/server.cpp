@@ -31,8 +31,6 @@
 #include <fstream>
 #include "cl_test.pb.h"
 
-DEFINE_int32(logoff_ms, 2000, "Maximum duration of server's LOGOFF state "
-             "(waiting for client to close connection before server stops)");
 DEFINE_int32(server_bthread_concurrency, 4, 
              "Configuring the value of bthread_concurrency, For compute max qps, ");
 DEFINE_int32(server_sync_sleep_us, 2500, 
@@ -93,7 +91,7 @@ public:
         , _running_case(false) {
     };
 
-    virtual ~EchoServiceImpl() {};
+    virtual ~EchoServiceImpl() {}
 
     void SetTestCase(const test::TestCase& test_case) {
         _test_case = test_case;
@@ -273,7 +271,7 @@ private:
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     bthread::FLAGS_bthread_concurrency= FLAGS_server_bthread_concurrency;
 
     brpc::Server server;

@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <map>
+#include <unordered_map>
 #include <vector>
 #include "butil/time.h"
 #include "butil/macros.h"
@@ -94,73 +95,117 @@ TEST_F(FlatMapTest, swap_pooled_allocator) {
 
 TEST_F(FlatMapTest, copy_flat_map) {
     typedef butil::FlatMap<std::string, std::string> Map;
-    Map uninit_m1;
-    ASSERT_FALSE(uninit_m1.initialized());
-    ASSERT_TRUE(uninit_m1.empty());
+    Map default_init_m1;
+    ASSERT_TRUE(default_init_m1.initialized());
+    ASSERT_TRUE(default_init_m1.empty());
+    ASSERT_EQ(BRPC_FLATMAP_DEFAULT_NBUCKET, default_init_m1.bucket_count());
     // self assignment does nothing.
-    uninit_m1 = uninit_m1;
-    ASSERT_FALSE(uninit_m1.initialized());
-    ASSERT_TRUE(uninit_m1.empty());
-    // Copy construct from uninitialized map.
-    Map uninit_m2 = uninit_m1;
-    ASSERT_FALSE(uninit_m2.initialized());
-    ASSERT_TRUE(uninit_m2.empty());
-    // assign uninitialized map to uninitialized map.
-    Map uninit_m3;
-    uninit_m3 = uninit_m1;
-    ASSERT_FALSE(uninit_m3.initialized());
-    ASSERT_TRUE(uninit_m3.empty());
-    // assign uninitialized map to initialized map.
+    default_init_m1 = default_init_m1;
+    ASSERT_TRUE(default_init_m1.initialized());
+    ASSERT_TRUE(default_init_m1.empty());
+    ASSERT_EQ(BRPC_FLATMAP_DEFAULT_NBUCKET, default_init_m1.bucket_count());
+
+    Map default_init_m2 = default_init_m1;
+    ASSERT_TRUE(default_init_m2.initialized());
+    ASSERT_TRUE(default_init_m2.empty());
+    ASSERT_EQ(BRPC_FLATMAP_DEFAULT_NBUCKET, default_init_m1.bucket_count());
+
+    Map init_m3;
+    ASSERT_TRUE(init_m3.initialized());
+    // smaller than the default value, and the default buckets
+    // is continued to be used.
+    ASSERT_EQ(0, init_m3.init(8));
+    ASSERT_TRUE(init_m3.initialized());
+    ASSERT_EQ(BRPC_FLATMAP_DEFAULT_NBUCKET, init_m3.bucket_count());
+    ASSERT_EQ(init_m3._default_buckets, init_m3._buckets);
+    init_m3["hello"] = "world";
+    ASSERT_EQ(1u, init_m3.size());
+    init_m3 = default_init_m1;
+    ASSERT_TRUE(init_m3.initialized());
+    ASSERT_TRUE(init_m3.empty());
+
     Map init_m4;
-    ASSERT_EQ(0, init_m4.init(16));
     ASSERT_TRUE(init_m4.initialized());
+    // Resize to a larger buckets, and then not using the default buckets.
+    ASSERT_EQ(0, init_m4.init(BRPC_FLATMAP_DEFAULT_NBUCKET + 1));
+    ASSERT_EQ(butil::flatmap_round(BRPC_FLATMAP_DEFAULT_NBUCKET + 1),
+              init_m4.bucket_count());
+    ASSERT_NE(init_m4._default_buckets, init_m4._buckets);
     init_m4["hello"] = "world";
     ASSERT_EQ(1u, init_m4.size());
-    init_m4 = uninit_m1;
+    init_m4 = default_init_m1;
     ASSERT_TRUE(init_m4.initialized());
     ASSERT_TRUE(init_m4.empty());
+    ASSERT_EQ(butil::flatmap_round(BRPC_FLATMAP_DEFAULT_NBUCKET + 1),
+              init_m4.bucket_count());
 
     Map m1;
     ASSERT_EQ(0, m1.init(16));
-    m1["hello"] = "world";
-    m1["foo"] = "bar";
+    size_t expected_count = 0;
+    m1["hello"] = "world"; ++expected_count;
+    m1["foo"] = "bar"; ++ expected_count;
+    m1["friend"] = "alice"; ++ expected_count;
+    m1["zone"] = "bj-01"; ++ expected_count;
+    m1["city"] = "shanghai"; ++ expected_count;
+    m1["owner"] = "bob"; ++ expected_count;
+    m1["lang"] = "chinese"; ++ expected_count;
     ASSERT_TRUE(m1.initialized());
-    ASSERT_EQ(2u, m1.size());
+    ASSERT_EQ(expected_count, m1.size());
     // self assignment does nothing.
     m1 = m1;
-    ASSERT_EQ(2u, m1.size());
+    ASSERT_EQ(expected_count, m1.size());
     ASSERT_EQ("world", m1["hello"]);
     ASSERT_EQ("bar", m1["foo"]);
+    ASSERT_EQ("bob", m1["owner"]);
+    ASSERT_EQ("bj-01", m1["zone"]);
+    ASSERT_EQ("shanghai", m1["city"]);
+    ASSERT_EQ("chinese", m1["lang"]);
+    ASSERT_EQ("alice", m1["friend"]);
     // Copy construct from initialized map.
     Map m2 = m1;
     ASSERT_TRUE(m2.initialized());
-    ASSERT_EQ(2u, m2.size());
+    ASSERT_EQ(expected_count, m2.size());
     ASSERT_EQ("world", m2["hello"]);
     ASSERT_EQ("bar", m2["foo"]);
+    ASSERT_EQ("bob", m2["owner"]);
+    ASSERT_EQ("bj-01", m2["zone"]);
+    ASSERT_EQ("shanghai", m2["city"]);
+    ASSERT_EQ("chinese", m2["lang"]);
+    ASSERT_EQ("alice", m2["friend"]);
     // assign initialized map to uninitialized map.
     Map m3;
     m3 = m1;
     ASSERT_TRUE(m3.initialized());
-    ASSERT_EQ(2u, m3.size());
+    ASSERT_EQ(expected_count, m3.size());
     ASSERT_EQ("world", m3["hello"]);
     ASSERT_EQ("bar", m3["foo"]);
+    ASSERT_EQ("bob", m3["owner"]);
+    ASSERT_EQ("bj-01", m3["zone"]);
+    ASSERT_EQ("shanghai", m3["city"]);
+    ASSERT_EQ("chinese", m3["lang"]);
+    ASSERT_EQ("alice", m3["friend"]);
     // assign initialized map to initialized map (triggering resize)
     Map m4;
     ASSERT_EQ(0, m4.init(2));
-    ASSERT_LT(m4.bucket_count(), m1.bucket_count());
+    ASSERT_LE(m4.bucket_count(), m1.bucket_count());
     const void* old_buckets4 = m4._buckets;
     m4 = m1;
     ASSERT_EQ(m1.bucket_count(), m4.bucket_count());
-    ASSERT_NE(old_buckets4, m4._buckets);
-    ASSERT_EQ(2u, m4.size());
+    ASSERT_EQ(old_buckets4, m4._buckets);
+    ASSERT_EQ(expected_count, m4.size());
     ASSERT_EQ("world", m4["hello"]);
     ASSERT_EQ("bar", m4["foo"]);
+    ASSERT_EQ("bob", m4["owner"]);
+    ASSERT_EQ("bj-01", m4["zone"]);
+    ASSERT_EQ("shanghai", m4["city"]);
+    ASSERT_EQ("chinese", m4["lang"]);
+    ASSERT_EQ("alice", m4["friend"]);
     // assign initialized map to initialized map (no resize)
-    const size_t bcs[] = { 8, m1.bucket_count(), 32 };
+    const size_t bcs[] = { m1.bucket_count(), 32 };
     // less than m1.bucket_count but enough for holding the elements
-    ASSERT_LT(bcs[0], m1.bucket_count());
+    ASSERT_LE(bcs[0], m1.bucket_count());
     // larger than m1.bucket_count
-    ASSERT_GT(bcs[2], m1.bucket_count());
+    ASSERT_GE(bcs[1], m1.bucket_count());
     for (size_t i = 0; i < arraysize(bcs); ++i) {
         Map m5;
         ASSERT_EQ(0, m5.init(bcs[i]));
@@ -169,9 +214,14 @@ TEST_F(FlatMapTest, copy_flat_map) {
         m5 = m1;
         ASSERT_EQ(old_bucket_count5, m5.bucket_count());
         ASSERT_EQ(old_buckets5, m5._buckets);
-        ASSERT_EQ(2u, m5.size());
+        ASSERT_EQ(expected_count, m5.size());
         ASSERT_EQ("world", m5["hello"]);
         ASSERT_EQ("bar", m5["foo"]);
+        ASSERT_EQ("bob", m5["owner"]);
+        ASSERT_EQ("bj-01", m5["zone"]);
+        ASSERT_EQ("shanghai", m5["city"]);
+        ASSERT_EQ("chinese", m5["lang"]);
+        ASSERT_EQ("alice", m5["friend"]);
     }
 }
 
@@ -194,7 +244,7 @@ TEST_F(FlatMapTest, to_lower) {
     for (int c = -128; c < 128; ++c) {
         ASSERT_EQ((char)::tolower(c), butil::ascii_tolower(c)) << "c=" << c;
     }
-    
+
     const size_t input_len = 102;
     char input[input_len + 1];
     char input2[input_len + 1];
@@ -237,7 +287,7 @@ TEST_F(FlatMapTest, __builtin_ctzl_perf) {
         s += __builtin_ctzl(i);
     }
     tm1.stop();
-    LOG(INFO) << "__builtin_ctzl takes " << tm1.n_elapsed()/(double)N << "ns";
+    LOG(INFO) << "__builtin_ctzl takes " << tm1.n_elapsed()/(double)N << "ns s=" << s;
 }
 
 TEST_F(FlatMapTest, case_ignored_map) {
@@ -287,10 +337,13 @@ TEST_F(FlatMapTest, make_sure_all_methods_compile) {
     ASSERT_EQ(20, m1[2]);
     ASSERT_EQ(2u, m1.size());
     m1.insert(1, 100);
+    m1.insert({3, 30});
     ASSERT_EQ(100, m1[1]);
-    ASSERT_EQ(2u, m1.size());
-    ASSERT_EQ(NULL, m1.seek(3));
-    ASSERT_EQ(0u, m1.erase(3));
+    ASSERT_EQ(3u, m1.size());
+    ASSERT_TRUE(m1.seek(3));
+    ASSERT_EQ(NULL, m1.seek(4));
+    ASSERT_EQ(1u, m1.erase(3));
+    ASSERT_EQ(0u, m1.erase(4));
     ASSERT_EQ(2u, m1.size());
     ASSERT_EQ(1u, m1.erase(2));
     ASSERT_EQ(1u, m1.size());
@@ -344,7 +397,7 @@ TEST_F(FlatMapTest, flat_map_of_string) {
     for (size_t i = 0; i < N; ++i) {
         keys.push_back(butil::string_printf("up_latency_as_key_%lu", i));
     }
-    
+
     tm1.start();
     for (size_t i = 0; i < N; ++i) {
         m1[keys[i]] += i;
@@ -405,13 +458,65 @@ TEST_F(FlatMapTest, flat_map_of_string) {
 
     LOG(INFO) << "finding c_strings takes " << tm1.n_elapsed()/N
               << " " << tm2.n_elapsed()/N << " " << tm3.n_elapsed()/N
-              << " " << tm1_2.n_elapsed()/N;
-    
+              << " " << tm1_2.n_elapsed()/N << " sum=" << sum;
+
     for (size_t i = 0; i < N; ++i) {
         ASSERT_EQ(i, m1[keys[i]]) << "i=" << i;
         ASSERT_EQ(i, m2[keys[i]]);
         ASSERT_EQ(i, m3[keys[i]]);
     }
+
+    butil::FlatMap<std::string, std::string> m4;
+    m4["111"] = "222";
+    ASSERT_TRUE(m4.seek("111"));
+    ASSERT_EQ("222", *m4.seek("111"));
+    ASSERT_EQ(1UL, m4.size());
+    butil::FlatMap<std::string, std::string> m5;
+    m5["333"] = "444";
+    ASSERT_TRUE(m5.seek("333"));
+    ASSERT_EQ("444", *m5.seek("333"));
+    ASSERT_EQ(1UL, m5.size());
+
+    m4.swap(m5);
+    ASSERT_TRUE(m4.seek("333"));
+    ASSERT_EQ("444", *m4.seek("333"));
+    ASSERT_EQ(1UL, m4.size());
+    ASSERT_TRUE(m5.seek("111"));
+    ASSERT_EQ("222", *m5.seek("111"));
+    ASSERT_EQ(1UL, m5.size());
+
+    m4.resize(BRPC_FLATMAP_DEFAULT_NBUCKET + 1);
+    ASSERT_EQ(1UL, m4.size());
+    ASSERT_TRUE(m4.seek("333"));
+    ASSERT_EQ("444", *m4.seek("333"));
+    m4.swap(m5);
+    ASSERT_TRUE(m4.seek("111"));
+    ASSERT_EQ("222", *m4.seek("111"));
+    ASSERT_EQ(1UL, m4.size());
+    ASSERT_TRUE(m5.seek("333"));
+    ASSERT_EQ("444", *m5.seek("333"));
+    ASSERT_EQ(1UL, m5.size());
+
+    m5.swap(m4);
+    ASSERT_TRUE(m4.seek("333"));
+    ASSERT_EQ("444", *m4.seek("333"));
+    ASSERT_EQ(1UL, m4.size());
+    ASSERT_TRUE(m5.seek("111"));
+    ASSERT_EQ("222", *m5.seek("111"));
+    ASSERT_EQ(1UL, m5.size());
+
+    m5.resize(BRPC_FLATMAP_DEFAULT_NBUCKET + 1);
+    ASSERT_EQ(1UL, m5.size());
+    ASSERT_EQ("222", *m5.seek("111"));
+    ASSERT_EQ(1UL, m5.size());
+    m5.swap(m4);
+    ASSERT_TRUE(m4.seek("111"));
+    ASSERT_EQ("222", *m4.seek("111"));
+    ASSERT_EQ(1UL, m4.size());
+    ASSERT_TRUE(m5.seek("333"));
+    ASSERT_EQ("444", *m5.seek("333"));
+    ASSERT_EQ(1UL, m5.size());
+
 }
 
 TEST_F(FlatMapTest, fast_iterator) {
@@ -422,7 +527,7 @@ TEST_F(FlatMapTest, fast_iterator) {
     M2 m2;
 
     ASSERT_EQ(0, m1.init(16384));
-    ASSERT_EQ(-1, m1.init(1));
+    ASSERT_EQ(0, m1.init(1));
     ASSERT_EQ(0, m2.init(16384));
 
     ASSERT_EQ(NULL, m1._thumbnail);
@@ -502,11 +607,11 @@ typedef butil::FlatMap<uint64_t, uint64_t> PositionHintMap;
 static void fill_position_hint_map(PositionHintMap* map,
                                    std::vector<uint64_t>* keys) {
     srand(time(NULL));
-    const size_t N = 170;
+    const size_t N = 5;
     if (!map->initialized()) {
         ASSERT_EQ(0, map->init(N * 3 / 2, 80));
     }
-    
+
     keys->reserve(N);
     keys->clear();
     map->clear();
@@ -518,7 +623,7 @@ static void fill_position_hint_map(PositionHintMap* map,
         keys->push_back(key);
         (*map)[key] = i;
     }
-    LOG(INFO) << map->bucket_info();
+    LOG(INFO) << map->bucket_info() << ", size=" << map->size();
 }
 
 struct CountOnPause {
@@ -566,7 +671,7 @@ struct RemoveInsertVisitedOnPause {
             removed_keys.insert(removed_key);
             break;
         } while (true);
-        
+
         // Insert one
         uint64_t inserted_key =
             ((rand() % hint.offset) + rand() * hint.nbucket);
@@ -793,7 +898,7 @@ TEST_F(FlatMapTest, perf_cmp_with_map_storing_pointers) {
         sum += (m3.find(r[i]) != m3.end());
     }
     tm.stop();
-    LOG(INFO) << "std::set takes " << tm.n_elapsed()/r.size();
+    LOG(INFO) << "std::set takes " << tm.n_elapsed()/r.size() << " sum=" << sum;
 
     for (size_t i = 0; i < ARRAY_SIZE(ptr); ++i) {
         delete ptr[i];
@@ -809,14 +914,17 @@ struct Value {
     Value() : x_(0) { ++n_con; }
     Value(int x) : x_(x) { ++ n_con; }
     Value (const Value& rhs) : x_(rhs.x_) { ++ n_cp_con; }
-    ~Value() { ++ n_des; }
-    
+    ~Value() {
+        ++ n_des;
+        // CHECK(false);
+    }
+
     Value& operator= (const Value& rhs) {
         x_ = rhs.x_;
         ++ n_cp;
         return *this;
     }
-    
+
     bool operator== (const Value& rhs) const { return x_ == rhs.x_; }
     bool operator!= (const Value& rhs) const { return x_ != rhs.x_; }
 
@@ -833,6 +941,7 @@ struct Key {
     Key() : x_(0) { ++n_con_key; }
     Key(int x) : x_(x) { ++ n_con_key; }
     Key(const Key& rhs) : x_(rhs.x_) { ++ n_cp_con_key; }
+    void operator=(const Key& rhs) { x_ = rhs.x_; }
     ~Key() { ++ n_des_key; }
     int x_;
 };
@@ -864,16 +973,41 @@ TEST_F(FlatMapTest, key_value_are_not_constructed_before_first_insertion) {
 
 TEST_F(FlatMapTest, manipulate_uninitialized_map) {
     butil::FlatMap<int, int> m;
-    ASSERT_FALSE(m.initialized());
-    for (butil::FlatMap<int,int>::iterator it = m.begin(); it != m.end(); ++it) {
-        LOG(INFO) << "nothing";
-    }
+    ASSERT_TRUE(m.initialized());
     ASSERT_EQ(NULL, m.seek(1));
     ASSERT_EQ(0u, m.erase(1));
     ASSERT_EQ(0u, m.size());
     ASSERT_TRUE(m.empty());
-    ASSERT_EQ(0u, m.bucket_count());
-    ASSERT_EQ(0u, m.load_factor());
+    ASSERT_EQ(BRPC_FLATMAP_DEFAULT_NBUCKET, m.bucket_count());
+    ASSERT_EQ(80u, m.load_factor());
+    m[1] = 1;
+    ASSERT_EQ(1UL, m.size());
+    auto one = m.seek(1);
+    ASSERT_NE(nullptr, one);
+    ASSERT_EQ(1, *one);
+
+    butil::FlatMap<int, int> m2 = m;
+    one = m2.seek(1);
+    ASSERT_NE(nullptr, one);
+    ASSERT_EQ(1, *one);
+    m2[2] = 2;
+    ASSERT_EQ(2UL, m2.size());
+
+    m.swap(m2);
+    ASSERT_EQ(2UL, m.size());
+    ASSERT_EQ(1UL, m2.size());
+    auto two = m.seek(2);
+    ASSERT_NE(nullptr, two);
+    ASSERT_EQ(2, *two);
+
+    ASSERT_EQ(1UL, m2.erase(1));
+    ASSERT_EQ(0, m.init(32));
+    one = m.seek(1);
+    ASSERT_NE(nullptr, one);
+    ASSERT_EQ(1, *one);
+    two = m.seek(2);
+    ASSERT_NE(nullptr, two);
+    ASSERT_EQ(2, *two);
 }
 
 TEST_F(FlatMapTest, perf_small_string_map) {
@@ -912,7 +1046,7 @@ TEST_F(FlatMapTest, perf_small_string_map) {
         m2["Request-Id"] = "true";
         m2["Status-Code"] = "200";
         tm2.stop();
-    
+
         LOG(INFO) << "flatmap=" << tm1.n_elapsed()
                   << " ci_flatmap=" << tm4.n_elapsed()
                   << " map=" << tm2.n_elapsed()
@@ -920,12 +1054,10 @@ TEST_F(FlatMapTest, perf_small_string_map) {
     }
 }
 
-
 TEST_F(FlatMapTest, sanity) {
     typedef butil::FlatMap<uint64_t, long> Map;
     Map m;
-
-    ASSERT_FALSE(m.initialized());
+    ASSERT_TRUE(m.initialized());
     m.init(1000, 70);
     ASSERT_TRUE(m.initialized());
     ASSERT_EQ(0UL, m.size());
@@ -945,7 +1077,7 @@ TEST_F(FlatMapTest, sanity) {
     long* p = m.seek(k1);
     ASSERT_TRUE(p && *p == 10);
     ASSERT_EQ(0UL, m._pool.count_allocated());
-    
+
     ASSERT_EQ(NULL, m.seek(k2));
 
     // Override
@@ -954,7 +1086,7 @@ TEST_F(FlatMapTest, sanity) {
     ASSERT_FALSE(m.empty());
     p = m.seek(k1);
     ASSERT_TRUE(p && *p == 100);
-    
+
     // Insert another
     m[k3] = 20;
     ASSERT_EQ(2UL, m.size());
@@ -970,7 +1102,7 @@ TEST_F(FlatMapTest, sanity) {
     ASSERT_FALSE(m.empty());
     p = m.seek(k2);
     ASSERT_TRUE(p && *p == 30);
-    
+
     ASSERT_EQ(NULL, m.seek(2049));
 
     Map::iterator it = m.begin();
@@ -1025,9 +1157,13 @@ TEST_F(FlatMapTest, random_insert_erase) {
             for (int i = 0; i < 100000; ++i) {
                 int k = rand() % 0xFFFF;
                 int p = rand() % 1000;
+                ht[0].insert(k, i);
+                // LOG(INFO) << "i=" << i << " k=" << k;
+
+                // ASSERT_EQ(n_con + n_cp_con, n_des * 2)
+                // << " n_con=" << n_con << " n_cp_con=" << n_cp_con << " n_des=" << n_des << " n_cp=" << n_cp;
+                ref[0][k] = i;
                 if (p < 600) {
-                    ht[0].insert(k, i);
-                    ref[0][k] = i;
                 } else if(p < 999) {
                     ht[0].erase (k);
                     ref[0].erase (k);
@@ -1036,8 +1172,8 @@ TEST_F(FlatMapTest, random_insert_erase) {
                     ref[0].clear();
                 }
             }
-            
-            LOG(INFO) << "Check j=" << j;
+
+            // LOG(INFO) << "Check j=" << j;
             // bi-check
             for (int i=0; i<2; ++i) {
                 for (Map::iterator it = ht[i].begin(); it != ht[i].end(); ++it)
@@ -1046,7 +1182,7 @@ TEST_F(FlatMapTest, random_insert_erase) {
                     ASSERT_TRUE (it2 != ref[i].end());
                     ASSERT_EQ (it2->second, it->second);
                 }
-        
+
                 for (butil::hash_map<uint64_t, Value>::iterator it = ref[i].begin();
                      it != ref[i].end(); ++it)
                 {
@@ -1059,11 +1195,10 @@ TEST_F(FlatMapTest, random_insert_erase) {
         }
 
     }
-    // cout << "ht[0] = " << show(ht[0]) << endl
-    //      << "ht[1] = " << show(ht[1]) << endl;
 
-    //ASSERT_EQ (ht[0]._pool->alloc_num(), 0ul);
-    ASSERT_EQ (n_con + n_cp_con, n_des);
+    ASSERT_EQ (n_con + n_cp_con, n_des)
+        // todo delete
+        << "n_con=" << n_con << " n_cp_con=" << n_cp_con << " n_des=" << n_des << " n_cp=" << n_cp;
 
     LOG(INFO) << "n_con:" << n_con << std::endl
               << "n_cp_con:" << n_cp_con << std::endl
@@ -1072,23 +1207,28 @@ TEST_F(FlatMapTest, random_insert_erase) {
               << "n_cp:" << n_cp;    
 }
 
-template <typename T> void perf_insert_erase(bool random, const T& value)
-{
+template <typename T>
+void perf_insert_erase(bool random, const T& value) {
     size_t nkeys[] = { 100, 1000, 10000 };
     const size_t NPASS = ARRAY_SIZE(nkeys);
 
     std::vector<uint64_t> keys;
     butil::FlatMap<uint64_t, T> id_map;
+    butil::MultiFlatMap<uint64_t, T> multi_id_map;
     std::map<uint64_t, T> std_map;
     butil::PooledMap<uint64_t, T> pooled_map;
+    std::unordered_map<uint64_t, T> std_unordered_map;
+    std::unordered_multimap<uint64_t, T> std_unordered_multimap;
     butil::hash_map<uint64_t, T> hash_map;
-    butil::Timer id_tm, std_tm, pooled_tm, hash_tm;
+    butil::Timer id_tm, multi_id_tm, std_tm, pooled_tm,
+                 std_unordered_tm, std_unordered_multi_tm, hash_tm;
     
     size_t max_nkeys = 0;
     for (size_t i = 0; i < NPASS; ++i) {
         max_nkeys = std::max(max_nkeys, nkeys[i]);
     }
     id_map.init((size_t)(nkeys[NPASS-1] * 1.5));
+    multi_id_map.init((size_t)(nkeys[NPASS-1] * 1.5));
 
     // Make DS hot
     for (size_t i = 0; i < max_nkeys; ++i) {
@@ -1100,6 +1240,8 @@ template <typename T> void perf_insert_erase(bool random, const T& value)
     id_map.clear();
     std_map.clear();
     pooled_map.clear();
+    std_unordered_map.clear();
+    std_unordered_multimap.clear();
     hash_map.clear();
 
     LOG(INFO) << "[ value = " << sizeof(T) << " bytes ]";
@@ -1113,13 +1255,20 @@ template <typename T> void perf_insert_erase(bool random, const T& value)
         if (random) {
             random_shuffle(keys.begin(), keys.end());
         }
-        
-        id_map.clear();        
+
+        id_map.clear();
         id_tm.start();
         for (size_t i = 0; i < keys.size(); ++i) {
             id_map[keys[i]] = value;
         }
         id_tm.stop();
+
+        multi_id_map.clear();
+        multi_id_tm.start();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            multi_id_map[keys[i]] = value;
+        }
+        multi_id_tm.stop();
 
         std_map.clear();
         std_tm.start();
@@ -1135,6 +1284,20 @@ template <typename T> void perf_insert_erase(bool random, const T& value)
         }
         pooled_tm.stop();
 
+        std_unordered_map.clear();
+        std_unordered_tm.start();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            std_unordered_map[keys[i]] = value;
+        }
+        std_unordered_tm.stop();
+
+        std_unordered_multimap.clear();
+        std_unordered_multi_tm.start();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            std_unordered_multimap.insert({ keys[i], value });
+        }
+        std_unordered_multi_tm.stop();
+
         hash_map.clear();
         hash_tm.start();
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -1144,10 +1307,14 @@ template <typename T> void perf_insert_erase(bool random, const T& value)
         
         LOG(INFO) << (random ? "Randomly" : "Sequentially")
                   << " inserting " << keys.size()
-                  << " into FlatMap/std::map/butil::PooledMap/butil::hash_map takes "
+                  << " into FlatMap/MultiFlatMap/std::map/butil::PooledMap/"
+                     "std::unordered_map/std::unordered_multimap/butil::hash_map takes "
                   << id_tm.n_elapsed() / keys.size()
+                  << "/" << multi_id_tm.n_elapsed() / keys.size()
                   << "/" << std_tm.n_elapsed() / keys.size()
                   << "/" << pooled_tm.n_elapsed() / keys.size()
+                  << "/" << std_unordered_tm.n_elapsed() / keys.size()
+                  << "/" << std_unordered_multi_tm.n_elapsed() / keys.size()
                   << "/" << hash_tm.n_elapsed() / keys.size();
         
         if (random) {
@@ -1159,6 +1326,12 @@ template <typename T> void perf_insert_erase(bool random, const T& value)
             id_map.erase(keys[i]);
         }
         id_tm.stop();
+
+        multi_id_tm.start();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            multi_id_map.erase(keys[i]);
+        }
+        multi_id_tm.stop();
 
         std_tm.start();
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -1172,6 +1345,18 @@ template <typename T> void perf_insert_erase(bool random, const T& value)
         }
         pooled_tm.stop();
 
+        std_unordered_tm.start();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            std_unordered_map.erase(keys[i]);
+        }
+        std_unordered_tm.stop();
+
+        std_unordered_multi_tm.start();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            std_unordered_multimap.erase(keys[i]);
+        }
+        std_unordered_multi_tm.stop();
+
         hash_tm.start();
         for (size_t i = 0; i < keys.size(); ++i) {
             hash_map.erase(keys[i]);
@@ -1180,27 +1365,36 @@ template <typename T> void perf_insert_erase(bool random, const T& value)
         
         LOG(INFO) << (random ? "Randomly" : "Sequentially")
                   << " erasing " << keys.size()
-                  << " from FlatMap/std::map/butil::PooledMap/butil::hash_map takes "
+                  << " from FlatMap/MultiFlatMap/std::map/butil::PooledMap/"
+                     "std::unordered_map/std::unordered_multimap/butil::hash_map takes "
                   << id_tm.n_elapsed() / keys.size()
+                  << "/" << multi_id_tm.n_elapsed() / keys.size()
                   << "/" << std_tm.n_elapsed() / keys.size()
                   << "/" << pooled_tm.n_elapsed() / keys.size()
+                  << "/" << std_unordered_tm.n_elapsed() / keys.size()
+                  << "/" << std_unordered_multi_tm.n_elapsed() / keys.size()
                   << "/" << hash_tm.n_elapsed() / keys.size();
     }
 }
 
-template <typename T> void perf_seek(const T& value) {
+template <typename T>
+void perf_seek(const T& value) {
     size_t nkeys[] = { 100, 1000, 10000 };
     const size_t NPASS = ARRAY_SIZE(nkeys);
     std::vector<uint64_t> keys;
     std::vector<uint64_t> rkeys;
     butil::FlatMap<uint64_t, T> id_map;
+    butil::MultiFlatMap<uint64_t, T> multi_id_map;
     std::map<uint64_t, T> std_map;
     butil::PooledMap<uint64_t, T> pooled_map;
+    std::unordered_map<uint64_t, T> std_unordered_map;
+    std::unordered_multimap<uint64_t, T> std_unordered_multimap;
     butil::hash_map<uint64_t, T> hash_map;
-    
-    butil::Timer id_tm, std_tm, pooled_tm, hash_tm;
-    
+    butil::Timer id_tm, multi_id_tm, std_tm, pooled_tm,
+                 std_unordered_tm, std_unordered_multi_tm, hash_tm;
+
     id_map.init((size_t)(nkeys[NPASS-1] * 1.5));
+    multi_id_map.init((size_t)(nkeys[NPASS-1] * 1.5));
     LOG(INFO) << "[ value = " << sizeof(T) << " bytes ]";
     for (size_t pass = 0; pass < NPASS; ++pass) {
         int start = rand();
@@ -1208,10 +1402,15 @@ template <typename T> void perf_seek(const T& value) {
         for (size_t i = 0; i < nkeys[pass]; ++i) {
             keys.push_back(start + i);
         }
-        
-        id_map.clear();        
+
+        id_map.clear();
         for (size_t i = 0; i < keys.size(); ++i) {
             id_map[keys[i]] = value;
+        }
+
+        multi_id_map.clear();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            multi_id_map[keys[i]] = value;
         }
 
         std_map.clear();
@@ -1222,6 +1421,16 @@ template <typename T> void perf_seek(const T& value) {
         pooled_map.clear();
         for (size_t i = 0; i < keys.size(); ++i) {
             pooled_map[keys[i]] = value;
+        }
+
+        std_unordered_map.clear();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            std_unordered_map[keys[i]] = value;
+        }
+
+        std_unordered_multimap.clear();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            std_unordered_multimap.insert({ keys[i], value });
         }
 
         hash_map.clear();
@@ -1238,6 +1447,12 @@ template <typename T> void perf_seek(const T& value) {
         }
         id_tm.stop();
 
+        multi_id_tm.start();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            sum += *(long*)multi_id_map.seek(keys[i]);
+        }
+        multi_id_tm.stop();
+
         std_tm.start();
         for (size_t i = 0; i < keys.size(); ++i) {
             sum += (long&)std_map.find(keys[i])->second;
@@ -1250,6 +1465,18 @@ template <typename T> void perf_seek(const T& value) {
         }
         pooled_tm.stop();
 
+        std_unordered_tm.start();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            sum += (long&)std_unordered_map[keys[i]];
+        }
+        std_unordered_tm.stop();
+
+        std_unordered_multi_tm.start();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            sum += (long&)std_unordered_multimap.find(keys[i])->second;
+        }
+        std_unordered_multi_tm.stop();
+
         hash_tm.start();
         for (size_t i = 0; i < keys.size(); ++i) {
             sum += (long&)hash_map.find(keys[i])->second;
@@ -1257,10 +1484,14 @@ template <typename T> void perf_seek(const T& value) {
         hash_tm.stop();
         
         LOG(INFO) << "Seeking " << keys.size()
-                  << " from FlatMap/std::map/butil::PooledMap/butil::hash_map takes "
+                  << " from FlatMap/MultiFlatMap/std::map/butil::PooledMap/"
+                     "std::unordered_map/std::unordered_multimap/butil::hash_map takes "
                   << id_tm.n_elapsed() / keys.size()
+                  << "/" << multi_id_tm.n_elapsed() / keys.size()
                   << "/" << std_tm.n_elapsed() / keys.size()
                   << "/" << pooled_tm.n_elapsed() / keys.size()
+                  << "/" << std_unordered_tm.n_elapsed() / keys.size()
+                  << "/" << std_unordered_multi_tm.n_elapsed() / keys.size()
                   << "/" << hash_tm.n_elapsed() / keys.size();
     }
 }
@@ -1296,6 +1527,93 @@ TEST_F(FlatMapTest, copy) {
     m2 = m1;
     ASSERT_FALSE(m1.is_too_crowded(m1.size()));
     ASSERT_FALSE(m2.is_too_crowded(m1.size()));
+}
+
+TEST_F(FlatMapTest, multi) {
+    // Construct non-POD values w/o copy-construction.
+    g_foo_ctor = 0;
+    g_foo_copy_ctor = 0;
+    g_foo_assign = 0;
+    butil::MultiFlatMap<int, Foo> map;
+    size_t bucket_count = 32;
+    ASSERT_EQ(0, map.init(bucket_count));
+    ASSERT_EQ(0, g_foo_ctor);
+    ASSERT_EQ(0, g_foo_copy_ctor);
+    ASSERT_EQ(0, g_foo_assign);
+    Foo& f1 = map[1];
+    ASSERT_EQ(1UL, map.size());
+    ASSERT_EQ(1, g_foo_ctor);
+    ASSERT_EQ(0, g_foo_copy_ctor);
+    ASSERT_EQ(0, g_foo_assign);
+    Foo& f2 = map[1];
+    ASSERT_EQ(2UL, map.size());
+    ASSERT_EQ(2, g_foo_ctor);
+    ASSERT_EQ(0, g_foo_copy_ctor);
+    ASSERT_EQ(0, g_foo_assign);
+    Foo f3;
+    Foo& f4 = *map.insert(1, f3);
+    ASSERT_EQ(3UL, map.size());
+    ASSERT_EQ(4, g_foo_ctor);
+    ASSERT_EQ(0, g_foo_copy_ctor);
+    ASSERT_EQ(1, g_foo_assign);
+    ASSERT_EQ(&f1, map.seek(1));
+    std::vector<Foo*> f_vec = map.seek_all(1);
+    ASSERT_EQ(3UL, f_vec.size());
+    ASSERT_NE(f_vec.end(), std::find(f_vec.begin(), f_vec.end(), &f1));
+    ASSERT_NE(f_vec.end(), std::find(f_vec.begin(), f_vec.end(), &f2));
+    ASSERT_NE(f_vec.end(), std::find(f_vec.begin(), f_vec.end(), &f4));
+
+    ASSERT_EQ(bucket_count, map.bucket_count());
+    int same_bucket_key = 1 + bucket_count;
+    butil::DefaultHasher<int> hasher;
+    ASSERT_EQ(butil::flatmap_mod(hasher(1), bucket_count),
+              butil::flatmap_mod(hasher(same_bucket_key), bucket_count));
+    ASSERT_EQ(0UL, map.erase(same_bucket_key));
+    Foo& f5 = map[same_bucket_key];
+    ASSERT_EQ(4UL, map.size());
+    ASSERT_EQ(&f5, map.seek(same_bucket_key));
+    ASSERT_EQ(1UL, map.seek_all(same_bucket_key).size());
+    ASSERT_EQ(5, g_foo_ctor);
+    ASSERT_EQ(0, g_foo_copy_ctor);
+    ASSERT_EQ(1, g_foo_assign);
+    ASSERT_EQ(&f5, map.seek(same_bucket_key));
+    ASSERT_EQ(3u, map.erase(1));
+    ASSERT_EQ(1UL, map.size());
+    ASSERT_EQ(nullptr, map.seek(1));
+    ASSERT_TRUE(map.seek_all(1).empty());
+    // Value node of same_bucket_key is the last one in the bucket,
+    // so it has been moved to the first node.
+    ASSERT_EQ(&f1, map.seek(same_bucket_key));
+    ASSERT_EQ(1UL, map.erase(same_bucket_key));
+    ASSERT_EQ(0UL, map.size());
+    ASSERT_EQ(nullptr, map.seek(same_bucket_key));
+    ASSERT_TRUE(map.seek_all(same_bucket_key).empty());
+
+    // Increase the capacity of bucket when hash collision occur and map is crowded.
+    for (size_t i = 0; i < bucket_count + 1; ++i) {
+        map[i] = Foo();
+    }
+    ASSERT_EQ(bucket_count + 1, map.size());
+    ASSERT_EQ(butil::flatmap_round(bucket_count + 1), map.bucket_count());
+
+    // No need to Increase the capacity of bucket when key is already in the map.
+    for (size_t i = 0; i < bucket_count + 1; ++i) {
+        map[1] = Foo();
+    }
+    ASSERT_EQ((bucket_count + 1) * 2, map.size());
+    ASSERT_EQ(butil::flatmap_round(bucket_count + 1), map.bucket_count());
+
+    // Zeroize POD values.
+    butil::MultiFlatMap<int, Bar> map2;
+    ASSERT_EQ(0, map2.init(32));
+    Bar& g = map2[1];
+    ASSERT_EQ(0, g.x);
+    g.x = 123;
+    ASSERT_EQ(1u, map2.erase(1));
+    ASSERT_EQ(123, g.x); // g is still accessible in this case.
+    Bar& g2 = map2[1];
+    ASSERT_EQ(&g, &g2);
+    ASSERT_EQ(0, g2.x);
 }
 
 }

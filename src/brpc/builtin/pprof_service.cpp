@@ -34,6 +34,7 @@
 #include "brpc/builtin/pprof_service.h"
 #include "brpc/builtin/common.h"
 #include "brpc/details/tcmalloc_extension.h"
+#include "brpc/details/jemalloc_profiler.h"
 #include "bthread/bthread.h"                // bthread_usleep
 #include "butil/fd_guard.h"
 
@@ -41,8 +42,8 @@ extern "C" {
 #if defined(OS_LINUX)
 extern char *program_invocation_name;
 #endif
-int __attribute__((weak)) ProfilerStart(const char* fname);
-void __attribute__((weak)) ProfilerStop();
+int BAIDU_WEAK ProfilerStart(const char* fname);
+void BAIDU_WEAK ProfilerStop();
 }
 
 namespace bthread {
@@ -213,6 +214,12 @@ void PProfService::heap(
     ::google::protobuf::Closure* done) {
     ClosureGuard done_guard(done);
     Controller* cntl = static_cast<Controller*>(controller_base);
+
+    if (HasJemalloc()) {
+        JeControlProfile(cntl);
+        return;
+    }
+
     MallocExtension* malloc_ext = MallocExtension::instance();
     if (malloc_ext == NULL || !has_TCMALLOC_SAMPLE_PARAMETER()) {
         const char* extra_desc = "";
@@ -220,7 +227,7 @@ void PProfService::heap(
             extra_desc = " (no TCMALLOC_SAMPLE_PARAMETER in env)";
         }
         cntl->SetFailed(ENOMETHOD, "Heap profiler is not enabled%s,"
-                        "check out http://wiki.baidu.com/display/RPC",
+                        "check out https://github.com/apache/brpc/blob/master/docs/cn/heap_profiler.md",
                         extra_desc);
         return;
     }

@@ -142,7 +142,7 @@ private:
     const char* _stream;
 };
 
-inline void PackHuluHeader(char* hulu_header, int meta_size, int body_size) {
+inline void PackHuluHeader(char* hulu_header, uint32_t meta_size, int body_size) {
     uint32_t* dummy = reinterpret_cast<uint32_t*>(hulu_header); // suppress strict-alias warning
     *dummy = *reinterpret_cast<const uint32_t*>("HULU");
     HuluRawPacker rp(hulu_header + 4);
@@ -152,7 +152,7 @@ inline void PackHuluHeader(char* hulu_header, int meta_size, int body_size) {
 template <typename Meta>
 static void SerializeHuluHeaderAndMeta(
     butil::IOBuf* out, const Meta& meta, int payload_size) {
-    const int meta_size = meta.ByteSize();
+    const uint32_t meta_size = GetProtobufByteSize(meta);
     if (meta_size <= 244) { // most common cases
         char header_and_meta[12 + meta_size];
         PackHuluHeader(header_and_meta, meta_size, payload_size);
@@ -304,8 +304,15 @@ static void SendHuluResponse(int64_t correlation_id,
     
     // Have the risk of unlimited pending responses, in which case, tell
     // users to set max_concurrency.
+    ResponseWriteInfo args;
     Socket::WriteOptions wopt;
     wopt.ignore_eovercrowded = true;
+    bthread_id_t response_id = INVALID_BTHREAD_ID;
+    if (span) {
+        CHECK_EQ(0, bthread_id_create(&response_id, &args, HandleResponseWritten));
+        wopt.id_wait = response_id;
+        wopt.notify_on_success = true;
+    }
     if (sock->Write(&res_buf, &wopt) != 0) {
         const int errcode = errno;
         PLOG_IF(WARNING, errcode != EPIPE) << "Fail to write into " << *sock;
@@ -313,9 +320,12 @@ static void SendHuluResponse(int64_t correlation_id,
                         sock->description().c_str());
         return;
     }
+
     if (span) {
+        bthread_id_join(response_id);
+        // Do not care about the result of background writing.
         // TODO: this is not sent
-        span->set_sent_us(butil::cpuwide_time_us());
+        span->set_sent_us(args.sent_us);
     }
 }
 
@@ -422,12 +432,6 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
             break;
         }
 
-        if (socket->is_overcrowded()) {
-            cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
-                            butil::endpoint2str(socket->remote_side()).c_str());
-            break;
-        }
-
         if (!server_accessor.AddConcurrency(cntl.get())) {
             cntl->SetFailed(ELIMIT, "Reached server's max_concurrency=%d",
                             server->options().max_concurrency);
@@ -454,6 +458,14 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
             sp->service->CallMethod(sp->method, cntl.get(), &breq, &bres, NULL);
             break;
         }
+        if (socket->is_overcrowded() &&
+            !server->options().ignore_eovercrowded &&
+            !sp->ignore_eovercrowded) {
+            cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
+                            butil::endpoint2str(socket->remote_side()).c_str());
+            break;
+        }
+
         // Switch to service-specific error.
         non_service_error.release();
         method_status = sp->status;
@@ -469,6 +481,11 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
         google::protobuf::Service* svc = sp->service;
         const google::protobuf::MethodDescriptor* method = sp->method;
         accessor.set_method(method);
+
+        if (!server->AcceptRequest(cntl.get())) {
+            break;
+        }
+
         if (span) {
             span->ResetServerSpanName(method->full_name());
         }
@@ -499,7 +516,7 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
                 req.get(), res.get(), server,
                 method_status, msg->received_us());
 
-        // optional, just release resourse ASAP
+        // optional, just release resource ASAP
         msg.reset();
         req_buf.clear();
 
@@ -535,8 +552,8 @@ bool VerifyHuluRequest(const InputMessageBase* msg_base) {
     Socket* socket = msg->socket();
     const Server* server = static_cast<const Server*>(msg->arg());
 
-    HuluRpcRequestMeta meta;
-    if (!ParsePbFromIOBuf(&meta, msg->meta)) {
+    HuluRpcRequestMeta request_meta;
+    if (!ParsePbFromIOBuf(&request_meta, msg->meta)) {
         LOG(WARNING) << "Fail to parse HuluRpcRequestMeta";
         return false;
     }
@@ -544,13 +561,32 @@ bool VerifyHuluRequest(const InputMessageBase* msg_base) {
     if (NULL == auth) {
         // Fast pass (no authentication)
         return true;
-    }    
-    if (auth->VerifyCredential(
-                meta.credential_data(), socket->remote_side(), 
-                socket->mutable_auth_context()) != 0) {
-        return false;
     }
-    return true;
+    if (auth->VerifyCredential(request_meta.credential_data(),
+                               socket->remote_side(),
+                               socket->mutable_auth_context()) == 0) {
+        return true;
+    }
+
+    // Send `ERPCAUTH' to client.
+    HuluRpcResponseMeta response_meta;
+    response_meta.set_correlation_id(request_meta.correlation_id());
+    response_meta.set_error_code(ERPCAUTH);
+    std::string user_error_text = auth->GetUnauthorizedErrorText();
+    response_meta.set_error_text("Fail to authenticate");
+    if (!user_error_text.empty()) {
+        response_meta.mutable_error_text()->append(": ");
+        response_meta.mutable_error_text()->append(user_error_text);
+    }
+    butil::IOBuf res_buf;
+    SerializeHuluHeaderAndMeta(&res_buf, request_meta, 0);
+    Socket::WriteOptions opt;
+    opt.ignore_eovercrowded = true;
+    if (socket->Write(&res_buf, &opt) != 0) {
+        PLOG_IF(WARNING, errno != EPIPE) << "Fail to write into " << *socket;
+    }
+
+    return false;
 }
 
 void ProcessHuluResponse(InputMessageBase* msg_base) {
@@ -619,7 +655,7 @@ void ProcessHuluResponse(InputMessageBase* msg_base) {
     }
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     accessor.OnResponse(cid, saved_error);
 }
 

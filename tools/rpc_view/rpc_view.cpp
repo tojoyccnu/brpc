@@ -24,6 +24,7 @@
 
 DEFINE_int32(port, 8888, "TCP Port of this server");
 DEFINE_string(target, "", "The server to view");
+DEFINE_int32(timeout_ms, 5000, "Timeout for calling the server to view");
 
 // handle HTTP response of accessing builtin services of the target server.
 static void handle_response(brpc::Controller* client_cntl,
@@ -66,7 +67,7 @@ static void handle_response(brpc::Controller* client_cntl,
 class ViewServiceImpl : public ViewService {
 public:
     ViewServiceImpl() {}
-    virtual ~ViewServiceImpl() {};
+    virtual ~ViewServiceImpl() {}
     virtual void default_method(google::protobuf::RpcController* cntl_base,
                                 const HttpRequest*,
                                 HttpResponse*,
@@ -81,13 +82,13 @@ public:
         const std::string* newtarget =
             server_cntl->http_request().uri().GetQuery("changetarget");
         if (newtarget) {
-            if (GFLAGS_NS::SetCommandLineOption("target", newtarget->c_str()).empty()) {
+            if (GFLAGS_NAMESPACE::SetCommandLineOption("target", newtarget->c_str()).empty()) {
                 server_cntl->SetFailed("Fail to change value of -target");
                 return;
             }
             target = *newtarget;
         } else {
-            if (!GFLAGS_NS::GetCommandLineOption("target", &target)) {
+            if (!GFLAGS_NAMESPACE::GetCommandLineOption("target", &target)) {
                 server_cntl->SetFailed("Fail to get value of -target");
                 return;
             }
@@ -135,7 +136,7 @@ public:
         // query "seconds", we set the timeout to be longer than "seconds".
         const std::string* seconds =
             server_cntl->http_request().uri().GetQuery("seconds");
-        int64_t timeout_ms = 5000;
+        int64_t timeout_ms = FLAGS_timeout_ms;
         if (seconds) {
             timeout_ms += atoll(seconds->c_str()) * 1000;
         }
@@ -152,15 +153,15 @@ public:
 };
 
 int main(int argc, char* argv[]) {
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     if (FLAGS_target.empty() &&
         (argc != 2 || 
-         GFLAGS_NS::SetCommandLineOption("target", argv[1]).empty())) {
+         GFLAGS_NAMESPACE::SetCommandLineOption("target", argv[1]).empty())) {
         LOG(ERROR) << "Usage: ./rpc_view <ip>:<port>";
         return -1;
     }
     // This keeps ad-hoc creation of channels reuse previous connections.
-    GFLAGS_NS::SetCommandLineOption("defer_close_seconds", "10");
+    GFLAGS_NAMESPACE::SetCommandLineOption("defer_close_second", "10");
 
     brpc::Server server;
     server.set_version("rpc_view_server");

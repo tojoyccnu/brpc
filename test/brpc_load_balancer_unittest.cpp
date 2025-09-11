@@ -20,28 +20,27 @@
 // Date: Sun Jul 13 15:04:18 CST 2014
 
 #include <sys/types.h>
-#include <sys/socket.h>
 #include <map>
 #include <gtest/gtest.h>
 #include "bthread/bthread.h"
-#include "butil/gperftools_profiler.h"
-#include "butil/time.h"
-#include "butil/fast_rand.h"
+#include "gperftools_helper.h"
+#include "butil/compiler_specific.h"
 #include "butil/containers/doubly_buffered_data.h"
 #include "brpc/describable.h"
 #include "brpc/socket.h"
+#include "brpc/socket_map.h"
+#include "brpc/global.h"
+#include "brpc/details/load_balancer_with_naming.h"
 #include "butil/strings/string_number_conversions.h"
-#include "brpc/excluded_servers.h" 
 #include "brpc/policy/weighted_round_robin_load_balancer.h"
 #include "brpc/policy/round_robin_load_balancer.h"
+#include "brpc/policy/weighted_randomized_load_balancer.h"
 #include "brpc/policy/randomized_load_balancer.h"
 #include "brpc/policy/locality_aware_load_balancer.h"
 #include "brpc/policy/consistent_hashing_load_balancer.h"
 #include "brpc/policy/hasher.h"
-#include "brpc/errno.pb.h"
 #include "echo.pb.h"
 #include "brpc/channel.h"
-#include "brpc/controller.h"
 #include "brpc/server.h"
 
 namespace brpc {
@@ -70,17 +69,7 @@ protected:
     };
 };
 
-size_t TLS_ctor = 0;
-size_t TLS_dtor = 0;
-struct TLS {
-    TLS() {
-        ++TLS_ctor;
-    }
-    ~TLS() {
-        ++TLS_dtor;
-    }
-
-};
+class UserTLS {};
 
 struct Foo {
     Foo() : x(0) {}
@@ -92,37 +81,254 @@ bool AddN(Foo& f, int n) {
     return true;
 }
 
-TEST_F(LoadBalancerTest, doubly_buffered_data) {
-    const size_t old_TLS_ctor = TLS_ctor;
-    const size_t old_TLS_dtor = TLS_dtor;
-    {
-        butil::DoublyBufferedData<Foo, TLS> d2;
-        butil::DoublyBufferedData<Foo, TLS>::ScopedPtr ptr;
-        d2.Read(&ptr);
-        ASSERT_EQ(old_TLS_ctor + 1, TLS_ctor);
-    }
-    ASSERT_EQ(old_TLS_ctor + 1, TLS_ctor);
-    ASSERT_EQ(old_TLS_dtor + 1, TLS_dtor);
+void read_cb(const Foo& f) {
+    ASSERT_EQ(0, f.x);
+}
 
-    butil::DoublyBufferedData<Foo> d;
+struct CallableObj {
+    void operator()(const Foo& f) {
+        ASSERT_EQ(0, f.x);
+    }
+};
+
+template <typename DBD>
+void test_doubly_buffered_data() {
+    // test doubly_buffered_data TLS limits
     {
-        butil::DoublyBufferedData<Foo>::ScopedPtr ptr;
+        std::cout << "current PTHREAD_KEYS_MAX: " << PTHREAD_KEYS_MAX << std::endl;
+        DBD data[PTHREAD_KEYS_MAX + 1];
+        typename DBD::ScopedPtr ptr;
+        ASSERT_EQ(0, data[PTHREAD_KEYS_MAX].Read(&ptr));
+        ASSERT_EQ(0, ptr->x);
+    }
+
+    DBD d;
+    {
+        typename DBD::ScopedPtr ptr;
         ASSERT_EQ(0, d.Read(&ptr));
         ASSERT_EQ(0, ptr->x);
     }
     {
-        butil::DoublyBufferedData<Foo>::ScopedPtr ptr;
+        ASSERT_EQ(0, d.Read([](const Foo& f) {
+            ASSERT_EQ(0, f.x);
+        }));
+        ASSERT_EQ(0, d.Read(read_cb));
+        ASSERT_EQ(0, d.Read(CallableObj()));
+        CallableObj co;
+        ASSERT_EQ(0, d.Read(co));
+    }
+    {
+        typename DBD::ScopedPtr ptr;
         ASSERT_EQ(0, d.Read(&ptr));
         ASSERT_EQ(0, ptr->x);
     }
 
     d.Modify(AddN, 10);
+    d.Modify([](Foo& f, int n) -> size_t {
+        f.x += n;
+        return 1;
+    }, 10);
     {
-        butil::DoublyBufferedData<Foo>::ScopedPtr ptr;
+        typename DBD::ScopedPtr ptr;
         ASSERT_EQ(0, d.Read(&ptr));
-        ASSERT_EQ(10, ptr->x);
+        ASSERT_EQ(20, ptr->x);
     }
 }
+
+TEST_F(LoadBalancerTest, doubly_buffered_data) {
+    test_doubly_buffered_data<butil::DoublyBufferedData<Foo>>();
+    test_doubly_buffered_data<butil::DoublyBufferedData<Foo, butil::Void, false>>();
+    test_doubly_buffered_data<butil::DoublyBufferedData<Foo, UserTLS, false>>();
+    test_doubly_buffered_data<butil::DoublyBufferedData<Foo, butil::Void, true>>();
+}
+
+bool exitFlag = false;
+
+template <typename DBD>
+void* DBDBthread(void* arg) {
+    auto d = static_cast<DBD*>(arg);
+    while(!exitFlag){
+        typename DBD::ScopedPtr ptr;
+        d->Read(&ptr);
+
+        // If DBD is DoublyBufferedData<T, TLS, false>, may cause deadlock.
+        bthread_usleep(100 * 1000);
+    }
+
+    return NULL;
+}
+
+template <typename DBD>
+void DBDMultiBthread() {
+    DBD d;
+    d.Modify(AddN, 1);
+    {
+        typename DBD::ScopedPtr ptr;
+        ASSERT_EQ(0, d.Read(&ptr));
+        ASSERT_EQ(1, ptr->x);
+    }
+
+    bthread_t tids[10000];
+    for (size_t i = 0; i < ARRAY_SIZE(tids); ++i) {
+        ASSERT_EQ(0, bthread_start_urgent(&tids[i], NULL, DBDBthread<DBD>, &d));
+    }
+
+    // Modify during reading.
+    int64_t start = butil::gettimeofday_ms();
+    while (butil::gettimeofday_ms() - start < 10 * 1000) {
+        d.Modify(AddN, 1);
+        typename DBD::ScopedPtr ptr;
+        d.Read(&ptr);
+        usleep(100 * 1000);
+    }
+    exitFlag = true;
+    for (size_t i = 0; i < ARRAY_SIZE(tids); ++i) {
+        ASSERT_EQ(0, bthread_join(tids[i], NULL));
+    }
+}
+
+// Deadlock, only for test.
+// TEST_F(LoadBalancerTest, doubly_buffered_data_multi_bthread) {
+//     DBDMultiBthread<butil::DoublyBufferedData<Foo>>();
+//     DBDMultiBthread<butil::DoublyBufferedData<Foo, butil::Void, false>>();
+// }
+
+TEST_F(LoadBalancerTest, doubly_buffered_data_bthread_multi_bthread) {
+    DBDMultiBthread<butil::DoublyBufferedData<Foo, butil::Void, true>>();
+}
+
+
+bool g_started = false;
+bool g_stopped = false;
+int g_prof_name_counter = 0;
+
+using PerfMap = std::unordered_map<int, int>;
+
+bool AddMapN(PerfMap& f, int n) {
+    ++f[n];
+    return true;
+}
+
+template<typename DBD>
+struct BAIDU_CACHELINE_ALIGNMENT PerfArgs {
+    DBD* dbd;
+    int64_t counter;
+    int64_t elapse_ns;
+    bool ready;
+
+    PerfArgs() : dbd(NULL), counter(0), elapse_ns(0), ready(false) {}
+};
+
+template<typename DBD>
+void* read_dbd(void* void_arg) {
+    auto args = (PerfArgs<DBD>*)void_arg;
+    args->ready = true;
+    butil::Timer t;
+    while (!g_stopped) {
+        if (g_started) {
+            break;
+        }
+        bthread_usleep(10);
+    }
+    t.start();
+    while (!g_stopped) {
+        {
+            typename DBD::ScopedPtr ptr;
+            args->dbd->Read(&ptr);
+            // ptr->find(1);
+        }
+        ++args->counter;
+    }
+    t.stop();
+    args->elapse_ns = t.n_elapsed();
+    return NULL;
+}
+
+template<typename DBD>
+void PerfTest(int thread_num, bool modify_during_reading) {
+    g_started = false;
+    g_stopped = false;
+    DBD dbd;
+    for (int i = 0; i < 1024; ++i) {
+        dbd.Modify(AddMapN, i);
+    }
+    pthread_t threads[thread_num];
+    std::vector<PerfArgs<DBD>> args(thread_num);
+    for (int i = 0; i < thread_num; ++i) {
+        args[i].dbd = &dbd;
+        ASSERT_EQ(0, pthread_create(&threads[i], NULL, read_dbd<DBD>, &args[i]));
+    }
+    while (true) {
+        bool all_ready = true;
+        for (int i = 0; i < thread_num; ++i) {
+            if (!args[i].ready) {
+                all_ready = false;
+                break;
+            }
+        }
+        if (all_ready) {
+            break;
+        }
+        usleep(1000);
+    }
+    g_started = true;
+    char prof_name[32];
+    snprintf(prof_name, sizeof(prof_name), "doubly_buffered_data_%d.prof", ++g_prof_name_counter);
+    ProfilerStart(prof_name);
+    int64_t run_ms = 5 * 1000;
+    if (modify_during_reading) {
+        int64_t start = butil::gettimeofday_ms();
+        int i = 1;
+        while (butil::gettimeofday_ms() - start < run_ms) {
+            ASSERT_TRUE(dbd.Modify(AddMapN, i++));
+            usleep(1000);
+        }
+    } else {
+        usleep(run_ms * 1000);
+    }
+    ProfilerStop();
+    g_stopped = true;
+    int64_t wait_time = 0;
+    int64_t count = 0;
+    for (int i = 0; i < thread_num; ++i) {
+        pthread_join(threads[i], NULL);
+        wait_time += args[i].elapse_ns;
+        count += args[i].counter;
+    }
+    LOG(INFO) << butil::class_name<DBD>()
+              << " thread_num=" << thread_num
+              << " modify_during_reading=" << modify_during_reading
+              << " count=" << count
+              << " average_time=" << wait_time / (double)count
+              << " qps=" << (double)count / wait_time * (1000 * 1000 * 1000);
+}
+
+TEST_F(LoadBalancerTest, dbd_performance) {
+    int thread_num = 1;
+    PerfTest<butil::DoublyBufferedData<PerfMap>>(thread_num, false);
+    PerfTest<butil::DoublyBufferedData<PerfMap>>(thread_num, true);
+    PerfTest<butil::DoublyBufferedData<PerfMap, butil::Void, true>>(thread_num, false);
+    PerfTest<butil::DoublyBufferedData<PerfMap, butil::Void, true>>(thread_num, true);
+
+    thread_num = 4;
+    PerfTest<butil::DoublyBufferedData<PerfMap>>(thread_num, false);
+    PerfTest<butil::DoublyBufferedData<PerfMap>>(thread_num, true);
+    PerfTest<butil::DoublyBufferedData<PerfMap, butil::Void, true>>(thread_num, false);
+    PerfTest<butil::DoublyBufferedData<PerfMap, butil::Void, true>>(thread_num, true);
+
+    thread_num = 8;
+    PerfTest<butil::DoublyBufferedData<PerfMap>>(thread_num, false);
+    PerfTest<butil::DoublyBufferedData<PerfMap>>(thread_num, true);
+    PerfTest<butil::DoublyBufferedData<PerfMap, butil::Void, true>>(thread_num, false);
+    PerfTest<butil::DoublyBufferedData<PerfMap, butil::Void, true>>(thread_num, true);
+
+    thread_num = 16;
+    PerfTest<butil::DoublyBufferedData<PerfMap>>(thread_num, false);
+    PerfTest<butil::DoublyBufferedData<PerfMap>>(thread_num, true);
+    PerfTest<butil::DoublyBufferedData<PerfMap, butil::Void, true>>(thread_num, false);
+    PerfTest<butil::DoublyBufferedData<PerfMap, butil::Void, true>>(thread_num, true);
+}
+
 
 typedef brpc::policy::LocalityAwareLoadBalancer LALB;
 
@@ -555,25 +761,28 @@ TEST_F(LoadBalancerTest, consistent_hashing) {
             "10.36.150.32:8833", 
             "10.92.149.48:8833", 
             "10.42.122.201:8833",
+            "[2408:871a:2100:3:0:ff:b025:348d]:8833",
+            "unix:test.sock",
     };
     for (size_t round = 0; round < ARRAY_SIZE(hashs); ++round) {
         brpc::policy::ConsistentHashingLoadBalancer chlb(hash_type[round]);
         std::vector<brpc::ServerId> ids;
         std::vector<butil::EndPoint> addrs;
-        for (int j = 0;j < 5; ++j) 
-        for (int i = 0; i < 5; ++i) {
-            const char *addr = servers[i];
-            //snprintf(addr, sizeof(addr), "192.168.1.%d:8080", i);
-            butil::EndPoint dummy;
-            ASSERT_EQ(0, str2endpoint(addr, &dummy));
-            brpc::ServerId id(8888);
-            brpc::SocketOptions options;
-            options.remote_side = dummy;
-            options.user = new SaveRecycle;
-            ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
-            ids.push_back(id);
-            addrs.push_back(dummy);
-            chlb.AddServer(id);
+        for (int j = 0;j < 5; ++j) {
+            for (size_t i = 0; i < ARRAY_SIZE(servers); ++i) {
+                const char *addr = servers[i];
+                //snprintf(addr, sizeof(addr), "192.168.1.%d:8080", i);
+                butil::EndPoint dummy;
+                ASSERT_EQ(0, str2endpoint(addr, &dummy));
+                brpc::ServerId id(8888);
+                brpc::SocketOptions options;
+                options.remote_side = dummy;
+                options.user = new SaveRecycle;
+                ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
+                ids.push_back(id);
+                addrs.push_back(dummy);
+                chlb.AddServer(id);
+            }
         }
         std::cout << chlb;
         for (int i = 0; i < 5; ++i) {
@@ -658,7 +867,7 @@ TEST_F(LoadBalancerTest, weighted_round_robin) {
 
     // Select the best server according to weight configured.
     // There are 3 valid servers with weight 3, 2 and 7 respectively.
-    // We run SelectServer for 12 times. The result number of each server seleted should be 
+    // We run SelectServer for 12 times. The result number of each server selected should be
     // consistent with weight configured.
     std::map<butil::EndPoint, size_t> select_result;
     brpc::SocketUniquePtr ptr;
@@ -676,7 +885,7 @@ TEST_F(LoadBalancerTest, weighted_round_robin) {
         std::cout << "1=" << s << ", ";
     } 
     std::cout << std::endl;   
-    // Check whether slected result is consistent with expected.
+    // Check whether selected result is consistent with expected.
     EXPECT_EQ((size_t)3, select_result.size());
     for (const auto& result : select_result) {
         std::cout << result.first << " result=" << result.second 
@@ -724,6 +933,83 @@ TEST_F(LoadBalancerTest, weighted_round_robin_no_valid_server) {
     brpc::LoadBalancer::SelectOut out(&ptr);
     EXPECT_EQ(EHOSTDOWN, wrrlb.SelectServer(in, &out));
     brpc::ExcludedServers::Destroy(exclude);
+}
+
+TEST_F(LoadBalancerTest, weighted_randomized) {
+    const char* servers[] = {
+        "10.92.115.19:8831",
+        "10.42.108.25:8832",
+        "10.36.150.31:8833",
+        "10.36.150.32:8899",
+        "10.92.149.48:8834",
+        "10.42.122.201:8835",
+        "10.42.122.202:8836"
+    };
+    std::string weight[] = {"3", "2", "5", "10", "1ab", "-1", "0"};
+    std::map<butil::EndPoint, int> configed_weight;
+    uint64_t configed_weight_sum = 0;
+    brpc::policy::WeightedRandomizedLoadBalancer wrlb;
+    size_t valid_weight_num = 4;
+
+    // Add server to selected list. The server with invalid weight will be skipped.
+    for (size_t i = 0;  i < ARRAY_SIZE(servers); ++i) {
+        const char *addr = servers[i];
+        butil::EndPoint dummy;
+        ASSERT_EQ(0, str2endpoint(addr, &dummy));
+        brpc::ServerId id(8888);
+        brpc::SocketOptions options;
+        options.remote_side = dummy;
+        options.user = new SaveRecycle;
+        ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
+        id.tag = weight[i];
+        if (i < valid_weight_num) {
+            int weight_num = 0;
+            ASSERT_TRUE(butil::StringToInt(weight[i], &weight_num));
+            configed_weight[dummy] = weight_num;
+            configed_weight_sum += weight_num;
+            EXPECT_TRUE(wrlb.AddServer(id));
+        } else {
+            EXPECT_FALSE(wrlb.AddServer(id));
+        }
+    }
+
+    // Select the best server according to weight configured.
+    // There are 4 valid servers with weight 3, 2, 5 and 10 respectively.
+    // We run SelectServer for multiple times. The result number of each server selected should be
+    // weight randomized with weight configured.
+    std::map<butil::EndPoint, size_t> select_result;
+    brpc::SocketUniquePtr ptr;
+    brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, NULL };
+    brpc::LoadBalancer::SelectOut out(&ptr);
+    int run_times = configed_weight_sum * 100;
+    std::vector<butil::EndPoint> select_servers;
+    for (int i = 0; i < run_times; ++i) {
+        EXPECT_EQ(0, wrlb.SelectServer(in, &out));
+        select_servers.emplace_back(ptr->remote_side());
+        ++select_result[ptr->remote_side()];
+    }
+
+    for (const auto& server : select_servers) {
+        std::cout << "weight randomized=" << server << ", ";
+    }
+    std::cout << std::endl;
+
+    // Check whether selected result is weight with expected.
+    EXPECT_EQ(valid_weight_num, select_result.size());
+    std::cout << "configed_weight_sum=" << configed_weight_sum << " run_times=" << run_times << std::endl;
+    for (const auto& result : select_result) {
+        double actual_rate = result.second * 1.0 / run_times;
+        double expect_rate = configed_weight[result.first] * 1.0 / configed_weight_sum;
+        std::cout << result.first << " weight=" << configed_weight[result.first]
+            << " select_times=" << result.second
+            << " actual_rate=" << actual_rate << " expect_rate=" << expect_rate
+            << " expect_rate/2=" << expect_rate/2 << " expect_rate*2=" << expect_rate*2
+            << std::endl;
+        // actual_rate >= expect_rate / 2
+        ASSERT_GE(actual_rate, expect_rate / 2);
+        // actual_rate <= expect_rate * 2
+        ASSERT_LE(actual_rate, expect_rate * 2);
+    }
 }
 
 TEST_F(LoadBalancerTest, health_check_no_valid_server) {
@@ -845,7 +1131,7 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_sanity) {
     {
         brpc::SocketUniquePtr dummy_ptr;
         ASSERT_EQ(1, brpc::Socket::AddressFailedAsWell(ptr[0]->id(), &dummy_ptr));
-        dummy_ptr->Revive();
+        dummy_ptr->Revive(2);
     }
     bthread_usleep(brpc::FLAGS_detect_available_server_interval_ms * 1000);
     // After one server is revived, the reject rate should be 50%
@@ -870,6 +1156,7 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_sanity) {
     }
 }
 
+#ifndef BUTIL_USE_ASAN
 class EchoServiceImpl : public test::EchoService {
 public:
     EchoServiceImpl()
@@ -929,11 +1216,11 @@ TEST_F(LoadBalancerTest, invalid_lb_params) {
 }
 
 TEST_F(LoadBalancerTest, revived_from_all_failed_intergrated) {
-    GFLAGS_NS::SetCommandLineOption("circuit_breaker_short_window_size", "20");
-    GFLAGS_NS::SetCommandLineOption("circuit_breaker_short_window_error_percent", "30");
+    GFLAGS_NAMESPACE::SetCommandLineOption("circuit_breaker_short_window_size", "20");
+    GFLAGS_NAMESPACE::SetCommandLineOption("circuit_breaker_short_window_error_percent", "30");
     // Those two lines force the interval of first hc to 3s
-    GFLAGS_NS::SetCommandLineOption("circuit_breaker_max_isolation_duration_ms", "3000");
-    GFLAGS_NS::SetCommandLineOption("circuit_breaker_min_isolation_duration_ms", "3000");
+    GFLAGS_NAMESPACE::SetCommandLineOption("circuit_breaker_max_isolation_duration_ms", "3000");
+    GFLAGS_NAMESPACE::SetCommandLineOption("circuit_breaker_min_isolation_duration_ms", "3000");
 
     const char* lb_algo[] = { "random:min_working_instances=2 hold_seconds=2",
                               "rr:min_working_instances=2 hold_seconds=2" };
@@ -966,14 +1253,14 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_intergrated) {
     }
 
     butil::EndPoint point(butil::IP_ANY, 7777);
-    brpc::Server server;
     EchoServiceImpl service;
+    brpc::Server server;
     ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
     ASSERT_EQ(0, server.Start(point, NULL));
 
     butil::EndPoint point2(butil::IP_ANY, 7778);
-    brpc::Server server2;
     EchoServiceImpl service2;
+    brpc::Server server2;
     ASSERT_EQ(0, server2.AddService(&service2, brpc::SERVER_DOESNT_OWN_SERVICE));
     ASSERT_EQ(0, server2.Start(point2, NULL));
     
@@ -1001,6 +1288,23 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_intergrated) {
     }
     bthread_usleep(500000 /* sleep longer than timeout of channel */);
     ASSERT_EQ(0, num_failed.load(butil::memory_order_relaxed));
+}
+#endif // BUTIL_USE_ASAN
+
+TEST_F(LoadBalancerTest, la_selection_too_long) {
+    brpc::GlobalInitializeOrDie();
+    brpc::LoadBalancerWithNaming lb;
+    CHECK_EQ(0, lb.Init("list://127.0.0.1:8888", "la", nullptr, nullptr)); 
+    char addr[] = "127.0.0.1:8888";
+    butil::EndPoint ep;
+    ASSERT_EQ(0, str2endpoint(addr, &ep));
+    brpc::SocketId id;
+    ASSERT_EQ(0, brpc::SocketMapFind(brpc::SocketMapKey(ep), &id));
+    ASSERT_EQ(0, brpc::Socket::SetFailed(id));
+    brpc::LoadBalancer::SelectIn in = { 0, false, false, 0u, nullptr };
+    brpc::SocketUniquePtr ptr;
+    brpc::LoadBalancer::SelectOut out(&ptr);
+    ASSERT_EQ(EHOSTDOWN, lb.SelectServer(in, &out));
 }
 
 } //namespace

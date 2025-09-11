@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// bthread - A M:N threading library to make applications more concurrent.
+// bthread - An M:N threading library to make applications more concurrent.
 
 // Date: Fri Dec  5 13:40:57 CST 2014
 
@@ -28,6 +28,8 @@
 # ifndef cpu_relax
 #if defined(ARCH_CPU_ARM_FAMILY)
 # define cpu_relax() asm volatile("yield\n": : :"memory")
+#elif defined(ARCH_CPU_LOONGARCH64_FAMILY)
+# define cpu_relax() asm volatile("nop\n": : :"memory");
 #else
 # define cpu_relax() asm volatile("pause\n": : :"memory")
 #endif

@@ -34,7 +34,9 @@
 #include "brpc/controller.h"                // brpc::Controller
 #include "brpc/details/profiler_linker.h"
 #include "brpc/retry_policy.h"
+#include "brpc/backup_request_policy.h"
 #include "brpc/naming_service_filter.h"
+#include "brpc/health_check_option.h"
 
 namespace brpc {
 
@@ -55,11 +57,12 @@ struct ChannelOptions {
     int32_t timeout_ms;
 
     // Send another request if RPC does not finish after so many milliseconds.
-    // Overridable by Controller.set_backup_request_ms().
+    // Overridable by Controller.set_backup_request_ms() or
+    // Controller.set_backup_request_policy().
     // The request will be sent to a different server by best effort.
     // If timeout_ms is set and backup_request_ms >= timeout_ms, backup request
     // will never be sent.
-    // backup request does NOT imply server-side cancelation.
+    // backup request does NOT imply server-side cancellation.
     // Default: -1 (disabled)
     // Maximum: 0x7fffffff (roughly 30 days)
     int32_t backup_request_ms;
@@ -99,14 +102,26 @@ struct ChannelOptions {
 
     // SSL related options. Refer to `ChannelSSLOptions' for details
     bool has_ssl_options() const { return _ssl_options != NULL; }
-    const ChannelSSLOptions& ssl_options() const { return *_ssl_options.get(); }
+    const ChannelSSLOptions& ssl_options() const { return *_ssl_options; }
     ChannelSSLOptions* mutable_ssl_options();
+
+    // Let this channel use rdma rather than tcp.
+    // Default: false
+    bool use_rdma;
 
     // Turn on authentication for this channel if `auth' is not NULL.
     // Note `auth' will not be deleted by channel and must remain valid when
     // the channel is being used.
     // Default: NULL
     const Authenticator* auth;
+
+    // Customize the backup request time and whether to send backup request.
+    // Priority: `backup_request_policy' > `backup_request_ms'.
+    // Overridable by Controller.set_backup_request_ms() or
+    // Controller.set_backup_request_policy().
+    // This object is NOT owned by channel and should remain valid when channel is used.
+    // Default: NULL
+    BackupRequestPolicy* backup_request_policy;
 
     // Customize the error code that should be retried. The interface is
     // defined in src/brpc/retry_policy.h
@@ -129,6 +144,10 @@ struct ChannelOptions {
     // Default: ""
     std::string connection_group;
 
+    // Set the health check param according to the channel granularity. 
+    // Its priority is higher than FLAGS_health_check_path and FLAGS_health_check_timeout_ms.
+    // When it is not set, FLAGS_health_check_path and FLAGS_health_check_timeout_ms will take effect.
+    HealthCheckOption hc_option;
 private:
     // SSLOptions is large and not often used, allocate it on heap to
     // prevent ChannelOptions from being bloated in most cases.
@@ -149,7 +168,9 @@ friend class Controller;
 friend class SelectiveChannel;
 public:
     Channel(ProfilerLinker = ProfilerLinker());
-    ~Channel();
+    virtual ~Channel();
+
+    DISALLOW_COPY_AND_ASSIGN(Channel);
 
     // Connect this channel to a single server whose address is given by the
     // first parameter. Use default options if `options' is NULL.
@@ -169,6 +190,8 @@ public:
     // Supported load balancer:
     //   rr                           # round robin, choose next server
     //   random                       # randomly choose a server
+    //   wr                           # weighted random
+    //   wrr                          # weighted round robin
     //   la                           # locality aware
     //   c_murmurhash/c_md5           # consistent hashing with murmurhash3/md5
     //   "" or NULL                   # treat `naming_service_url' as `server_addr_and_port'
@@ -197,9 +220,9 @@ public:
     // Sum of weights of servers that this channel connects to.
     int Weight();
 
-protected:
     int CheckHealth();
 
+protected:
     bool SingleServer() const { return _lb.get() == NULL; }
 
     // Pick a server using `lb' and then send RPC. Wait for response when 
@@ -213,8 +236,11 @@ protected:
     int InitChannelOptions(const ChannelOptions* options);
     int InitSingle(const butil::EndPoint& server_addr_and_port,
                    const char* raw_server_address,
-                   const ChannelOptions* options);
+                   const ChannelOptions* options,
+                   int raw_port = -1);
 
+    std::string _service_name;
+    std::string _scheme;
     butil::EndPoint _server_address;
     SocketId _server_id;
     Protocol::SerializeRequest _serialize_request;

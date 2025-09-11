@@ -22,12 +22,15 @@
 #include <sys/time.h>
 #include <time.h>
 #include <google/protobuf/descriptor.h>
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
+#include "json2pb/zero_copy_stream_writer.h"
+#include "json2pb/encode_decode.h"
+#include "json2pb/protobuf_map.h"
+#include "json2pb/rapidjson.h"
+#include "json2pb/pb_to_json.h"
+#include "json2pb/protobuf_type_resolver.h"
+#include "butil/iobuf.h"
 #include "butil/base64.h"
-#include "zero_copy_stream_writer.h"
-#include "encode_decode.h"
-#include "protobuf_map.h"
-#include "rapidjson.h"
-#include "pb_to_json.h"
 
 namespace json2pb {
 Pb2JsonOptions::Pb2JsonOptions()
@@ -40,7 +43,8 @@ Pb2JsonOptions::Pb2JsonOptions()
     , bytes_to_base64(true)
 #endif
     , jsonify_empty_array(false)
-    , always_print_primitive_fields(false) {
+    , always_print_primitive_fields(false)
+    , single_repeated_to_array(false) {
 }
 
 class PbToJsonConverter {
@@ -48,10 +52,10 @@ public:
     explicit PbToJsonConverter(const Pb2JsonOptions& opt) : _option(opt) {}
 
     template <typename Handler>
-    bool Convert(const google::protobuf::Message& message, Handler& handler);
+    bool Convert(const google::protobuf::Message& message, Handler& handler, bool root_msg = false);
 
     const std::string& ErrorText() const { return _error; }
-    
+
 private:
     template <typename Handler>
     bool _PbFieldToJson(const google::protobuf::Message& message,
@@ -63,11 +67,10 @@ private:
 };
 
 template <typename Handler>
-bool PbToJsonConverter::Convert(const google::protobuf::Message& message, Handler& handler) {
-    handler.StartObject();
+bool PbToJsonConverter::Convert(const google::protobuf::Message& message, Handler& handler, bool root_msg) {
     const google::protobuf::Reflection* reflection = message.GetReflection();
     const google::protobuf::Descriptor* descriptor = message.GetDescriptor();
-    
+
     int ext_range_count = descriptor->extension_range_count();
     int field_count = descriptor->field_count();
     std::vector<const google::protobuf::FieldDescriptor*> fields;
@@ -75,8 +78,12 @@ bool PbToJsonConverter::Convert(const google::protobuf::Message& message, Handle
     for (int i = 0; i < ext_range_count; ++i) {
         const google::protobuf::Descriptor::ExtensionRange*
             ext_range = descriptor->extension_range(i);
-        for (int tag_number = ext_range->start;
-             tag_number < ext_range->end; ++tag_number) {
+#if GOOGLE_PROTOBUF_VERSION < 4025000
+        for (int tag_number = ext_range->start; tag_number < ext_range->end; ++tag_number)
+#else
+        for (int tag_number = ext_range->start_number(); tag_number < ext_range->end_number(); ++tag_number)
+#endif
+        {
             const google::protobuf::FieldDescriptor* field =
                     reflection->FindKnownExtensionByNumber(tag_number);
             if (field) {
@@ -93,6 +100,14 @@ bool PbToJsonConverter::Convert(const google::protobuf::Message& message, Handle
             fields.push_back(field);
         }
     }
+
+    if (root_msg && _option.single_repeated_to_array) {
+        if (map_fields.empty() && fields.size() == 1 && fields.front()->is_repeated()) {
+            return _PbFieldToJson(message, fields.front(), handler);
+        }
+    }
+
+    handler.StartObject();
 
     // Fill in non-map fields
     std::string field_name_str;
@@ -288,12 +303,12 @@ bool ProtoMessageToJsonStream(const google::protobuf::Message& message,
                               OutputStream& os, std::string* error) {
     PbToJsonConverter converter(options);
     bool succ = false;
-    if (options.pretty_json) {    
+    if (options.pretty_json) {
         BUTIL_RAPIDJSON_NAMESPACE::PrettyWriter<OutputStream> writer(os);
-        succ = converter.Convert(message, writer); 
+        succ = converter.Convert(message, writer, true);
     } else {
         BUTIL_RAPIDJSON_NAMESPACE::OptimizedWriter<OutputStream> writer(os);
-        succ = converter.Convert(message, writer); 
+        succ = converter.Convert(message, writer, true);
     }
     if (!succ && error) {
         error->clear();
@@ -322,15 +337,43 @@ bool ProtoMessageToJson(const google::protobuf::Message& message,
 }
 
 bool ProtoMessageToJson(const google::protobuf::Message& message,
-                        google::protobuf::io::ZeroCopyOutputStream *stream,
+                        google::protobuf::io::ZeroCopyOutputStream* stream,
                         const Pb2JsonOptions& options, std::string* error) {
     json2pb::ZeroCopyStreamWriter wrapper(stream);
     return json2pb::ProtoMessageToJsonStream(message, options, wrapper, error);
 }
 
 bool ProtoMessageToJson(const google::protobuf::Message& message,
-                        google::protobuf::io::ZeroCopyOutputStream *stream,
+                        google::protobuf::io::ZeroCopyOutputStream* stream,
                         std::string* error) {
     return ProtoMessageToJson(message, stream, Pb2JsonOptions(), error);
 }
+
+bool ProtoMessageToProtoJson(const google::protobuf::Message& message,
+                             google::protobuf::io::ZeroCopyOutputStream* json,
+                             const Pb2ProtoJsonOptions& options, std::string* error) {
+    butil::IOBuf buf;
+    butil::IOBufAsZeroCopyOutputStream output_stream(&buf);
+    if (!message.SerializeToZeroCopyStream(&output_stream)) {
+        return false;
+    }
+
+    TypeResolverUniqueptr type_resolver = GetTypeResolver(message);
+    butil::IOBufAsZeroCopyInputStream input_stream(buf);
+    auto st = google::protobuf::util::BinaryToJsonStream(
+            type_resolver.get(), GetTypeUrl(message), &input_stream, json, options);
+
+    bool ok = st.ok();
+    if (!ok && NULL != error) {
+        *error = st.ToString();
+    }
+    return ok;
+}
+
+bool ProtoMessageToProtoJson(const google::protobuf::Message& message, std::string* json,
+                             const Pb2ProtoJsonOptions& options, std::string* error) {
+    google::protobuf::io::StringOutputStream output_stream(json);
+    return ProtoMessageToProtoJson(message, &output_stream, options, error);
+}
+
 } // namespace json2pb

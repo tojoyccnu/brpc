@@ -39,7 +39,13 @@ void* steal_thread(void* arg) {
         if (q->steal(&val)) {
             stolen->push_back(val);
         } else {
+#if defined(ARCH_CPU_ARM_FAMILY)
+            asm volatile("yield\n": : :"memory");
+#elif defined(ARCH_CPU_LOONGARCH64_FAMILY)
+            asm volatile("nop\n": : :"memory");
+#else
             asm volatile("pause\n": : :"memory");
+#endif
         }
     }
     return stolen;
@@ -103,6 +109,7 @@ TEST(WSQTest, sanity) {
         for (size_t j = 0; j < res->size(); ++j, ++nstolen) {
             values.push_back((*res)[j]);
         }
+        delete res;
     }
     pthread_join(wth, NULL);
     std::vector<value_type>* res = NULL;
@@ -110,6 +117,7 @@ TEST(WSQTest, sanity) {
     for (size_t j = 0; j < res->size(); ++j, ++npopped) {
         values.push_back((*res)[j]);
     }
+    delete res;
 
     value_type val;
     while (q.pop(&val)) {

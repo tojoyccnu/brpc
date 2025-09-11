@@ -19,61 +19,44 @@
 #ifndef BRPC_SERIALIZED_REQUEST_H
 #define BRPC_SERIALIZED_REQUEST_H
 
-#include <google/protobuf/message.h>
+#include "brpc/nonreflectable_message.h"
+#include "brpc/pb_compat.h"
 #include "butil/iobuf.h"
-#include "brpc/proto_base.pb.h"
 
 namespace brpc {
 
-class SerializedRequest : public ::google::protobuf::Message {
+class SerializedRequest : public NonreflectableMessage<SerializedRequest> {
 public:
     SerializedRequest();
-    virtual ~SerializedRequest();
-  
+    ~SerializedRequest() override;
+
     SerializedRequest(const SerializedRequest& from);
-  
+
     inline SerializedRequest& operator=(const SerializedRequest& from) {
         CopyFrom(from);
         return *this;
     }
-  
-    static const ::google::protobuf::Descriptor* descriptor();
-  
+
     void Swap(SerializedRequest* other);
-  
+
+    void MergeFrom(const SerializedRequest& from) override;
+
     // implements Message ----------------------------------------------
-  
-    SerializedRequest* New() const;
-    void CopyFrom(const ::google::protobuf::Message& from);
-    void CopyFrom(const SerializedRequest& from);
-    void Clear();
-    bool IsInitialized() const;
-    int ByteSize() const;
-    int GetCachedSize() const { return (int)_serialized.size(); }
+    void Clear() override;
+    size_t ByteSizeLong() const override;
+    int GetCachedSize() const PB_425_OVERRIDE { return ByteSize(); }
     butil::IOBuf& serialized_data() { return _serialized; }
     const butil::IOBuf& serialized_data() const { return _serialized; }
 
-protected:
-    ::google::protobuf::Metadata GetMetadata() const;
-    
+    ::google::protobuf::Metadata GetMetadata() const PB_527_OVERRIDE;
+
 private:
-    bool MergePartialFromCodedStream(
-        ::google::protobuf::io::CodedInputStream* input);
-    void SerializeWithCachedSizes(
-        ::google::protobuf::io::CodedOutputStream* output) const;
-    ::google::protobuf::uint8* SerializeWithCachedSizesToArray(
-        ::google::protobuf::uint8* output) const;
-    void MergeFrom(const ::google::protobuf::Message& from);
-    void MergeFrom(const SerializedRequest& from);
     void SharedCtor();
     void SharedDtor();
-    void SetCachedSize(int size) const;
-  
-private:
+
     butil::IOBuf _serialized;
 };
 
 } // namespace brpc
-
 
 #endif  // BRPC_SERIALIZED_REQUEST_H

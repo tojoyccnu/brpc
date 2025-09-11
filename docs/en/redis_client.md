@@ -1,6 +1,6 @@
 [中文版](../cn/redis_client.md)
 
-[redis](http://redis.io/) is one of the most popular caching service in recent years. Compared to memcached it provides users with more data structures and operations, speeding up developments. In order to access redis servers more conveniently and make full use of bthread's capability of concurrency, brpc directly supports the redis protocol. Check [example/redis_c++](https://github.com/brpc/brpc/tree/master/example/redis_c++/) for an example.
+[redis](http://redis.io/) is one of the most popular caching service in recent years. Compared to memcached it provides users with more data structures and operations, speeding up developments. In order to access redis servers more conveniently and make full use of bthread's capability of concurrency, brpc directly supports the redis protocol. Check [example/redis_c++](https://github.com/apache/brpc/tree/master/example/redis_c++/) for an example.
 
 Advantages compared to [hiredis](https://github.com/redis/hiredis) (the official redis client):
 
@@ -104,9 +104,20 @@ CHECK_EQ(10, response.reply(2).integer());
 CHECK_EQ(-10, response.reply(3).integer());
 ```
 
+# Request redis with authenticator
+
+Create a RedisAuthenticator, and set to ChannelOptions.
+
+```c++
+brpc::ChannelOptions options;
+brpc::policy::RedisAuthenticator* auth = new brpc::policy::RedisAuthenticator("my_password");
+options.auth = auth;
+```
+
+
 # RedisRequest
 
-A [RedisRequest](https://github.com/brpc/brpc/blob/master/src/brpc/redis.h) may contain multiple commands by calling `AddCommand*`, which returns true on success and false otherwise. **The callsite backtrace is also printed on error**.
+A [RedisRequest](https://github.com/apache/brpc/blob/master/src/brpc/redis.h) may contain multiple commands by calling `AddCommand*`, which returns true on success and false otherwise. **The callsite backtrace is also printed on error**.
 
 ```c++
 bool AddCommand(const char* fmt, ...);
@@ -115,6 +126,8 @@ bool AddCommandByComponents(const butil::StringPiece* components, size_t n);
 ```
 
 Formatting is compatible with hiredis, namely `%b` corresponds to binary data (pointer + length), others are similar to those in `printf`. Some improvements have been made such as characters enclosed by single or double quotes are recognized as one field regardless of the spaces inside. For example, `AddCommand("Set 'a key with space' 'a value with space as well'")` sets value `a value with space as well` to key `a key with space`, while in hiredis the command must be written as `redisvCommand(..., "SET% s% s", "a key with space", "a value with space as well");`
+
+> Note that if the `fmt` parameter of `AddCommand` and `AddCommandV` is set incorrectly, it may cause the program to crash or lead to data leakage. Please set it with caution. Should not use user input-influenced content as the `fmt` parameter!
 
 `AddCommandByComponents` is similar to `redisCommandArgv` in hiredis. Users specify each part of the command in an array, which is immune to escaping issues often occurring in `AddCommand` and `AddCommandV`. If you encounter errors such as "Unmatched quote" or "invalid format" when using `AddCommand` and `AddCommandV`, try this method.
 
@@ -126,7 +139,7 @@ Call `Clear()` before re-using the `RedisRequest` object.
 
 # RedisResponse
 
-A [RedisResponse](https://github.com/brpc/brpc/blob/master/src/brpc/redis.h) may contain one or multiple [RedisReply](https://github.com/brpc/brpc/blob/master/src/brpc/redis_reply.h)s. Use `reply_size()` for total number of replies and `reply(i)` for reference to the i-th reply (counting from 0). Note that in hiredis, if the request contains N commands, you have to call `redisGetReply` N times to get replies, while it's unnecessary in brpc as the `RedisResponse` already includes the N replies which are accessible by reply(i). As long as RPC is successful, `response.reply_size()` should be equal to `request.command_size()`, unless the redis-server is buggy. The precondition that redis works correctly is that replies correspond to commands one by one in the same sequence (positional correspondence).
+A [RedisResponse](https://github.com/apache/brpc/blob/master/src/brpc/redis.h) may contain one or multiple [RedisReply](https://github.com/apache/brpc/blob/master/src/brpc/redis_reply.h)s. Use `reply_size()` for total number of replies and `reply(i)` for reference to the i-th reply (counting from 0). Note that in hiredis, if the request contains N commands, you have to call `redisGetReply` N times to get replies, while it's unnecessary in brpc as the `RedisResponse` already includes the N replies which are accessible by reply(i). As long as RPC is successful, `response.reply_size()` should be equal to `request.command_size()`, unless the redis-server is buggy. The precondition that redis works correctly is that replies correspond to commands one by one in the same sequence (positional correspondence).
 
 Each `RedisReply` may be:
 
@@ -228,7 +241,7 @@ We can see a tremendous drop of QPS compared to the one using single connection 
 
 # Command Line Interface
 
-[example/redis_c++/redis_cli](https://github.com/brpc/brpc/blob/master/example/redis_c%2B%2B/redis_cli.cpp) is a command line tool similar to the official CLI, demostrating brpc's capability to talk with redis servers. When unexpected results are got from a redis-server using a brpc client, you can debug with this tool interactively as well.
+[example/redis_c++/redis_cli](https://github.com/apache/brpc/blob/master/example/redis_c%2B%2B/redis_cli.cpp) is a command line tool similar to the official CLI, demostrating brpc's capability to talk with redis servers. When unexpected results are got from a redis-server using a brpc client, you can debug with this tool interactively as well.
 
 Like the official CLI, `redis_cli <command>` runs the command directly, and `-server` which is address of the redis-server can be specified.
 

@@ -1,6 +1,23 @@
 #!/usr/bin/env python
 # coding=utf-8
 
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 """
 Bthread Stack Print Tool
 
@@ -24,6 +41,7 @@ Commands:
     6. bthread_reg_restore: bthread_frame will modify registers, reg_restore will restore them
     7. bthread_end: exit bthread debug mode
     8. bthread_regs <id>: print bthread registers
+    9. bthread_all: print all bthread frames
 
 when call bthread_frame, registers will be modified,
 remember to call bthread_end after debug, or process will be corrupted
@@ -41,10 +59,12 @@ def get_bthread_num():
     global_res = int(gdb.parse_and_eval("((*bthread::g_task_control)._nbthreads)._combiner._global_result"))
     get_agent = "(*(('bvar::detail::AgentCombiner<long, long, bvar::detail::AddTo<long> >::Agent' *){}))"
     last_node = root_agent
+    long_type = gdb.lookup_type("long")
     while True:
         agent = gdb.parse_and_eval(get_agent.format(last_node))
         if last_node != root_agent:
-            val = int(agent["element"]["_value"]["_M_i"])
+            val = int(agent["element"]["_value"].cast(long_type))
+            gdb.parse_and_eval(get_agent.format(last_node))
             global_res += val
         if agent["next_"] == root_agent:
             return global_res
@@ -54,15 +74,16 @@ def get_all_bthreads(total):
     global bthreads
     bthreads = []
     count = 0
-    groups = int(gdb.parse_and_eval("'butil::ResourcePool<bthread::TaskMeta>::_ngroup'")["val"])
+    groups = int(gdb.parse_and_eval("(size_t)'butil::ResourcePool<bthread::TaskMeta>::_ngroup'"))
     for group in range(groups):
-        blocks = int(gdb.parse_and_eval("(*((*((('butil::static_atomic<butil::ResourcePool<bthread::TaskMeta>::BlockGroup*>' *)('butil::ResourcePool<bthread::TaskMeta>::_block_groups')) + {})).val)).nblock._M_i".format(group)))
+        blocks = int(gdb.parse_and_eval("(unsigned long)(*((*((('butil::static_atomic<butil::ResourcePool<bthread::TaskMeta>::BlockGroup*>' *)('butil::ResourcePool<bthread::TaskMeta>::_block_groups')) + {})).val)).nblock".format(group)))
         for block in range(blocks):
-            items = int(gdb.parse_and_eval("(*(*(('butil::atomic<butil::ResourcePool<bthread::TaskMeta>::Block*>' *)((*((*((('butil::static_atomic<butil::ResourcePool<bthread::TaskMeta>::BlockGroup*>' *)('butil::ResourcePool<bthread::TaskMeta>::_block_groups')) + {})).val)).blocks) + {}))._M_b._M_p).nitem".format(group, block)))
+            items = int(gdb.parse_and_eval("(*(*(('butil::ResourcePool<bthread::TaskMeta>::Block' **)((*((*((('butil::static_atomic<butil::ResourcePool<bthread::TaskMeta>::BlockGroup*>' *)('butil::ResourcePool<bthread::TaskMeta>::_block_groups'))+ {})).val)).blocks) + {}))).nitem".format(group, block)))
             for item in range(items):
-                task_meta = gdb.parse_and_eval("*(('bthread::TaskMeta' *)((*(*(('butil::atomic<butil::ResourcePool<bthread::TaskMeta>::Block*>' *)((*((*((('butil::static_atomic<butil::ResourcePool<bthread::TaskMeta>::BlockGroup*>' *)('butil::ResourcePool<bthread::TaskMeta>::_block_groups')) + {})).val)).blocks) + {}))._M_b._M_p).items) + {})".format(group, block, item))
+                task_meta = gdb.parse_and_eval("*(('bthread::TaskMeta' *)((*(*(('butil::ResourcePool<bthread::TaskMeta>::Block' **)((*((*((('butil::static_atomic<butil::ResourcePool<bthread::TaskMeta>::BlockGroup*>' *)('butil::ResourcePool<bthread::TaskMeta>::_block_groups')) + {})).val)).blocks) + {}))).items) + {})".format(group, block, item))
                 version_tid = (int(task_meta["tid"]) >> 32)
-                version_butex = gdb.parse_and_eval("*(uint32_t *){}".format(task_meta["version_butex"]))
+                version_butex = gdb.parse_and_eval(
+                    "*(uint32_t *){}".format(task_meta["version_butex"]))
                 if version_tid == int(version_butex) and int(task_meta["attr"]["stack_type"]) != 0:
                     bthreads.append(task_meta)
                     count += 1
@@ -122,6 +143,35 @@ class BthreadFrameCmd(gdb.Command):
         gdb.parse_and_eval("$rip = {}".format(rip))
         gdb.parse_and_eval("$rsp = {}".format(rsp))
         gdb.parse_and_eval("$rbp = {}".format(rbp))
+
+class BthreadAllCmd(gdb.Command):
+    """print all bthread frames"""
+    def __init__(self):
+        gdb.Command.__init__(self, "bthread_all", gdb.COMMAND_STACK, gdb.COMPLETE_NONE)
+
+    def invoke(self, arg, tty):
+        global status
+        global bthreads
+        if not status:
+            print("Not in bthread debug mode")
+            return
+        for bthread_id in range(len(bthreads)):
+            stack = bthreads[bthread_id]["stack"]
+            if str(stack) == "0x0":
+                print("this bthread has no stack")
+                continue
+            try:
+                context = gdb.parse_and_eval("(*(('bthread::ContextualStack' *){})).context".format(stack))
+                rip = gdb.parse_and_eval("*(uint64_t*)({}+7*8)".format(context))
+                rbp = gdb.parse_and_eval("*(uint64_t*)({}+6*8)".format(context))
+                rsp = gdb.parse_and_eval("{}+8*8".format(context))
+                gdb.parse_and_eval("$rip = {}".format(rip))
+                gdb.parse_and_eval("$rsp = {}".format(rsp))
+                gdb.parse_and_eval("$rbp = {}".format(rbp))
+                print("Bthread {}:".format(bthread_id))
+                gdb.execute('bt')
+            except Exception as e:
+                pass
 
 class BthreadRegsCmd(gdb.Command):
     """bthread_regs <id>, print bthread registers"""
@@ -238,6 +288,7 @@ BthreadNumCmd()
 BthreadBeginCmd()
 BthreadEndCmd()
 BthreadFrameCmd()
+BthreadAllCmd()
 BthreadMetaCmd()
 BthreadRegRestoreCmd()
 BthreadRegsCmd()

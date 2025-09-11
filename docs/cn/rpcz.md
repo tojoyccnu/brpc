@@ -13,6 +13,7 @@
 | rpcz_database_dir          | ./rpc_data/rpcz      | For storing requests/contexts collected by rpcz. | src/baidu/rpc/span.cpp                 |
 | rpcz_keep_span_db          | false                | Don't remove DB of rpcz at program's exit | src/baidu/rpc/span.cpp                 |
 | rpcz_keep_span_seconds (R) | 3600                 | Keep spans for at most so many seconds   | src/baidu/rpc/span.cpp                 |
+| rpcz_save_span_min_latency_us (R) | 0 (default:0) | The minimum latency microseconds of span saved | src/baidu/rpc/span.cpp |
 
 若启动时未加-enable_rpcz，则可在启动后访问SERVER_URL/rpcz/enable动态开启rpcz，访问SERVER_URL/rpcz/disable则关闭，这两个链接等价于访问SERVER_URL/flags/enable_rpcz?setvalue=true和SERVER_URL/flags/enable_rpcz?setvalue=false。在r31010之后，rpc在html版本中增加了一个按钮可视化地开启和关闭。
 
@@ -48,10 +49,21 @@
 
 ## Annotation
 
-只要你使用了brpc，就可以使用[TRACEPRINTF](https://github.com/brpc/brpc/blob/master/src/brpc/traceprintf.h)打印内容到事件流中，比如：
+只要你使用了brpc，就可以使用[TRACEPRINTF](https://github.com/apache/brpc/blob/master/src/brpc/traceprintf.h)打印内容到事件流中，比如：
 
 ```c++
 TRACEPRINTF("Hello rpcz %d", 123);
 ```
 
 这条annotation会按其发生时间插入到对应请求的rpcz中。从这个角度看，rpcz是请求级的日志。如果你用TRACEPRINTF打印了沿路的上下文，便可看到请求在每个阶段停留的时间，牵涉到的数据集和参数。这是个很有用的功能。
+
+## 跨bthread传递trace上下文
+
+有的业务在处理server请求的时候，会创建子bthread，在子bthread中发起rpc调用。默认情况下，子bthread中的rpc调用跟原来的请求无法建立关联，trace就会断掉。这种情况下，可以在创建子bthread时，指定BTHREAD_INHERIT_SPAN标志，来显式地建立trace上文关联，如：
+
+```c++
+bthread_attr_t attr = { BTHREAD_STACKTYPE_NORMAL, BTHREAD_INHERIT_SPAN, NULL };
+bthread_start_urgent(&tid, &attr, thread_proc, arg);
+```
+
+注意：使用这种方式创建子bthread来发送rpc，请确保rpc在server返回response之前完成，否则可能导致使用被释放的Span对象而出core。

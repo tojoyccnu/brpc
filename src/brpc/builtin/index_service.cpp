@@ -48,8 +48,6 @@ void IndexService::default_method(::google::protobuf::RpcController* controller,
     Controller *cntl = (Controller*)controller;
     cntl->http_response().set_content_type("text/plain");
     const Server* server = cntl->server();
-    const butil::EndPoint my_addr(butil::my_ip(),
-                                 server->listen_address().port);
     const bool use_html = UseHTML(cntl->http_request());
     const bool as_more = cntl->http_request().uri().GetQuery("as_more");
     if (use_html && !as_more) {
@@ -89,9 +87,9 @@ void IndexService::default_method(::google::protobuf::RpcController* controller,
     }
     os << '\n';
     if (use_html) {
-        os << "<a href=\"https://github.com/brpc/brpc\">github</a>";
+        os << "<a href=\"https://github.com/apache/brpc\">github</a>";
     } else {
-        os << "github : https://github.com/brpc/brpc";
+        os << "github : https://github.com/apache/brpc";
     }
     os << NL << NL;
     if (!as_more) {
@@ -142,10 +140,18 @@ void IndexService::default_method(::google::protobuf::RpcController* controller,
            << (!IsHeapProfilerEnabled() ? " (disabled)" : "") << NL
            << Path("/hotspots/growth", html_addr)
            << " : Profiling growth of heap"
-           << (!IsHeapProfilerEnabled() ? " (disabled)" : "") << NL;
+           << (!IsHeapProfilerEnabled() ? " (disabled)" : "") << NL
+           << Path("/hotspots/contention", html_addr)
+           << " : Profiling contention of lock" << NL;
     }
-    os << "curl -H 'Content-Type: application/json' -d 'JSON' " << my_addr
-       << "/ServiceName/MethodName : Call method by http+json" << NL
+    os << "curl -H 'Content-Type: application/json' -d 'JSON' ";
+    if (butil::is_endpoint_extended(server->listen_address())) {
+        os << "<listen_address>";
+    } else {
+        const butil::EndPoint my_addr(butil::my_ip(), server->listen_address().port);
+        os << my_addr;
+    }
+    os << "/ServiceName/MethodName : Call method by http+json" << NL
     
        << Path("/version", html_addr)
        << " : Version of this server, set by Server::set_version()" << NL
@@ -159,7 +165,8 @@ void IndexService::default_method(::google::protobuf::RpcController* controller,
        << Path("/threads", html_addr) << " : Check pstack"
        << (!FLAGS_enable_threads_service ? " (disabled)" : "") << NL
        << Path("/dir", html_addr) << " : Browse directories and files"
-       << (!FLAGS_enable_dir_service ? " (disabled)" : "") << NL;
+       << (!FLAGS_enable_dir_service ? " (disabled)" : "") << NL
+       << Path("/memory", html_addr) << " : Get malloc allocator information" << NL;
     if (use_html) {
         os << "</body></html>";
     }

@@ -19,6 +19,7 @@
 #include <algorithm>                                           // std::set_union
 #include <array>
 #include <gflags/gflags.h>
+#include <openssl/md5.h>
 #include "butil/containers/flat_map.h"
 #include "butil/errno.h"
 #include "butil/strings/string_number_conversions.h"
@@ -32,6 +33,8 @@ namespace policy {
 // TODO: or 160?
 DEFINE_int32(chash_num_replicas, 100, 
              "default number of replicas per server in chash");
+DEFINE_bool(consistent_hashing_enable_server_tag, false, 
+             "if consistent hashing enable server with tag");
 
 // Defined in hasher.cpp.
 const char* GetHashName(HashFunc hasher);
@@ -69,9 +72,15 @@ bool DefaultReplicaPolicy::Build(ServerId server,
     }
     replicas->clear();
     for (size_t i = 0; i < num_replicas; ++i) {
-        char host[32];
-        int len = snprintf(host, sizeof(host), "%s-%lu",
+        char host[256];
+        int len = 0;
+        if (!FLAGS_consistent_hashing_enable_server_tag) {
+            len = snprintf(host, sizeof(host), "%s-%lu",
                            endpoint2str(ptr->remote_side()).c_str(), i);
+        } else {
+            len = snprintf(host, sizeof(host), "%s-%lu-%s",
+                           endpoint2str(ptr->remote_side()).c_str(), i, server.tag.c_str());
+        }
         ConsistentHashingLoadBalancer::Node node;
         node.hash = _hash_func(host, len);
         node.server_sock = server;
@@ -102,10 +111,16 @@ bool KetamaReplicaPolicy::Build(ServerId server,
     CHECK(num_replicas % points_per_hash == 0)
         << "Ketam hash replicas number(" << num_replicas << ") should be n*4";
     for (size_t i = 0; i < num_replicas / points_per_hash; ++i) {
-        char host[32];
-        int len = snprintf(host, sizeof(host), "%s-%lu",
+        char host[256];
+        int len = 0;
+        if (!FLAGS_consistent_hashing_enable_server_tag) {
+            len = snprintf(host, sizeof(host), "%s-%lu",
                            endpoint2str(ptr->remote_side()).c_str(), i);
-        unsigned char digest[16];
+        } else {
+            len = snprintf(host, sizeof(host), "%s-%lu-%s",
+                           endpoint2str(ptr->remote_side()).c_str(), i, server.tag.c_str());
+        }
+        unsigned char digest[MD5_DIGEST_LENGTH];
         MD5HashSignature(host, len, digest);
         for (size_t j = 0; j < points_per_hash; ++j) {
             ConsistentHashingLoadBalancer::Node node;
@@ -266,9 +281,6 @@ size_t ConsistentHashingLoadBalancer::RemoveServersInBatch(
     const size_t ret = _db_hash_ring.ModifyWithForeground(RemoveBatch, servers, &executed);
     CHECK(ret % _num_replicas == 0);
     const size_t n = ret / _num_replicas;
-    LOG_IF(ERROR, n != servers.size())
-        << "Fail to RemoveServersInBatch, expected " << servers.size()
-        << " actually " << n;
     return n;
 }
 

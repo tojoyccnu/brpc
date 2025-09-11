@@ -53,6 +53,15 @@ public:
     virtual ~Dumper() { }
     virtual bool dump(const std::string& name,
                       const butil::StringPiece& description) = 0;
+    // Only for dumping value of multiple dimension var to prometheus service
+    virtual bool dump_mvar(const std::string& name,
+                           const butil::StringPiece& description) {
+        return true;
+    }
+    // Only for dumping comment of multiple dimension var to prometheus service
+    virtual bool dump_comment(const std::string&, const std::string& /*type*/) {
+        return true;
+    }
 };
 
 // Options for Variable::dump_exposed().
@@ -158,6 +167,9 @@ public:
     // CAUTION!! Subclasses must call hide() manually to avoid displaying
     // a variable that is just destructing.
     bool hide();
+
+    // Check if this variable is is_hidden.
+    bool is_hidden() const;
 
     // Get exposed name. If this variable is not exposed, the name is empty.
     const std::string& name() const { return _name; }

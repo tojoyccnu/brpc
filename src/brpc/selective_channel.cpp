@@ -158,8 +158,8 @@ private:
 ChannelBalancer::~ChannelBalancer() {
     for (ChannelToIdMap::iterator
              it = _chan_map.begin(); it != _chan_map.end(); ++it) {
-        SocketUniquePtr ptr(it->second); // Dereference
         it->second->ReleaseAdditionalReference();
+        it->second->ReleaseHCRelatedReference();
     }
     _chan_map.clear();
 }
@@ -189,21 +189,33 @@ int ChannelBalancer::AddChannel(ChannelBase* sub_channel,
     SocketOptions options;
     options.user = sub_chan;
     options.health_check_interval_s = FLAGS_channel_check_interval;
-            
+
     if (Socket::Create(options, &sock_id) != 0) {
         delete sub_chan;
         LOG(ERROR) << "Fail to create fake socket for sub channel";
         return -1;
     }
     SocketUniquePtr ptr;
-    CHECK_EQ(0, Socket::Address(sock_id, &ptr));
+    int rc = Socket::AddressFailedAsWell(sock_id, &ptr);
+    if (rc < 0) {
+        LOG(ERROR) << "Fail to address SocketId=" << sock_id;
+        return -1;
+    }
+    if (rc > 0 && !ptr->HCEnabled()) {
+        LOG(ERROR) << "Health check of SocketId="
+                   << sock_id << " is disabled";
+        return -1;
+    }
     if (!AddServer(ServerId(sock_id))) {
         LOG(ERROR) << "Duplicated sub_channel=" << sub_channel;
         // sub_chan will be deleted when the socket is recycled.
         ptr->SetFailed();
+        // Cancel health checking.
+        ptr->ReleaseHCRelatedReference();
         return -1;
     }
-    _chan_map[sub_channel]= ptr.release();  // Add reference.
+    // The health-check-related reference has been held on created.
+    _chan_map[sub_channel]= ptr.get();
     if (handle) {
         *handle = sock_id;
     }
@@ -222,12 +234,11 @@ void ChannelBalancer::RemoveAndDestroyChannel(SelectiveChannel::ChannelHandle ha
             BAIDU_SCOPED_LOCK(_mutex);
             CHECK_EQ(1UL, _chan_map.erase(sub->chan));
         }
-        {
-            SocketUniquePtr ptr2(ptr.get()); // Dereference.
-        }
         if (rc == 0) {
             ptr->ReleaseAdditionalReference();
         }
+        // Cancel health checking.
+        ptr->ReleaseHCRelatedReference();
     }
 }
 
@@ -317,6 +328,7 @@ int Sender::IssueRPC(int64_t start_realtime_us) {
     // No need to count timeout. We already managed timeout in schan. If
     // timeout occurs, sub calls are canceled with ERPCTIMEDOUT.
     sub_cntl->_timeout_ms = -1;
+    sub_cntl->_real_timeout_ms = _main_cntl->timeout_ms();
 
     // Inherit following fields of _main_cntl.
     // TODO(gejun): figure out a better way to maintain these fields.
@@ -327,7 +339,8 @@ int Sender::IssueRPC(int64_t start_realtime_us) {
     sub_cntl->set_request_code(_main_cntl->request_code());
     // Forward request attachment to the subcall
     sub_cntl->request_attachment().append(_main_cntl->request_attachment());
-    
+    sub_cntl->http_request() = _main_cntl->http_request();
+
     sel_out.channel()->CallMethod(_main_cntl->_method,
                                   &r.sub_done->_cntl,
                                   _request,
@@ -351,6 +364,7 @@ void SubDone::Run() {
     main_cntl->_remote_side = _cntl._remote_side;
     // connection_type may be changed during CallMethod. 
     main_cntl->set_connection_type(_cntl.connection_type());
+    main_cntl->response_attachment().swap(_cntl.response_attachment());
     Resource r;
     r.response = _cntl._response;
     r.sub_done = this;

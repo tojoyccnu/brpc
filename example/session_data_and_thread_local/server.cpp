@@ -26,8 +26,6 @@ DEFINE_bool(echo_attachment, true, "Echo attachment as well");
 DEFINE_int32(port, 8002, "TCP Port of this server");
 DEFINE_int32(idle_timeout_s, -1, "Connection will be closed if there is no "
              "read/write operations during the last `idle_timeout_s'");
-DEFINE_int32(logoff_ms, 2000, "Maximum duration of server's LOGOFF state "
-             "(waiting for client to close connection before server stops)");
 DEFINE_int32(max_concurrency, 0, "Limit of request processing in parallel");
 
 butil::atomic<int> nsd(0);
@@ -213,7 +211,7 @@ void AsyncJob::run() {
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     // The factory to create MySessionLocalData. Must be valid when server is running.
     MySessionLocalDataFactory session_local_data_factory;

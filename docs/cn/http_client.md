@@ -2,7 +2,7 @@
 
 # 示例
 
-[example/http_c++](https://github.com/brpc/brpc/blob/master/example/http_c++/http_client.cpp)
+[example/http_c++](https://github.com/apache/brpc/blob/master/example/http_c++/http_client.cpp)
 
 # 关于h2
 
@@ -41,7 +41,7 @@ HTTP/h2和protobuf关系不大，所以除了Controller和done，CallMethod的�
 
 # POST
 
-默认的HTTP Method为GET，可设置为POST或[更多http method](https://github.com/brpc/brpc/blob/master/src/brpc/http_method.h)。待POST的数据应置入request_attachment()，它([butil::IOBuf](https://github.com/brpc/brpc/blob/master/src/butil/iobuf.h))可以直接append std::string或char*。
+默认的HTTP Method为GET，可设置为POST或[更多http method](https://github.com/apache/brpc/blob/master/src/brpc/http_method.h)。待POST的数据应置入request_attachment()，它([butil::IOBuf](https://github.com/apache/brpc/blob/master/src/butil/iobuf.h))可以直接append std::string或char*。
 
 ```c++
 brpc::Controller cntl;
@@ -101,7 +101,7 @@ URL的一般形式如下图：
 //                                               interpretable as extension
 ```
 
-在上面例子中可以看到，Channel.Init()和cntl.http_request().uri()被设置了相同的URL。为什么Channel为什么不直接利用Init时传入的URL，而需要给uri()再设置一次？
+在上面例子中可以看到，Channel.Init()和cntl.http_request().uri()被设置了相同的URL。为什么Channel不直接利用Init时传入的URL，而需要给uri()再设置一次？
 
 确实，在简单使用场景下，这两者有所重复，但在复杂场景中，两者差别很大，比如：
 
@@ -114,7 +114,9 @@ URL的一般形式如下图：
 
 若用户没有填且URL中包含host，比如http://www.foo.com/path，则http request中会包含"Host: www.foo.com"。
 
-若用户没有填且URL不包含host，比如"/index.html?name=value"，则框架会以目标server的ip和port为Host，地址为10.46.188.39:8989的http server将会看到"Host: 10.46.188.39:8989"。
+若用户没有填且URL不包含host，比如"/index.html?name=value"，但如果Channel初始化的地址scheme为http(s)且包含域名，则框架会以域名作为Host，比如"http://www.foo.com"，该http server将会看到"Host: www.foo.com"。如果地址是"http://www.foo.com:8989"，则该http server将会看到"Host: www.foo.com:8989"。
+
+若用户没有填且URL不包含host，比如"/index.html?name=value"，如果Channel初始化的地址也不包含域名，则框架会以目标server的ip和port为Host，地址为10.46.188.39:8989的http server将会看到"Host: 10.46.188.39:8989"。
 
 对应的字段在h2中叫":authority"。
 
@@ -177,6 +179,8 @@ Notes on http header:
 
 当Server返回的http status code不是2xx时，该次http/h2访问被视为失败，client端会把`cntl->ErrorCode()`设置为EHTTP，用户可通过`cntl->http_response().status_code()`获得具体的http错误。同时server端可以把代表错误的html或json置入`cntl->response_attachment()`作为http body传递回来。
 
+如果Server也是brpc框架实现的服务，client端希望在http/h2失败时获取brpc Server返回的真实`ErrorCode`，而不是统一设置的`EHTTP`，则需要设置GFlag`-use_http_error_code=true`。
+
 # 压缩request body
 
 调用Controller::set_request_compress_type(brpc::COMPRESS_TYPE_GZIP)将尝试用gzip压缩http body。
@@ -220,7 +224,7 @@ brpc client支持在读取完body前就结束RPC，让用户在RPC结束后再�
    class ProgressiveReader {
    public:
        // Called when one part was read.
-       // Error returned is treated as *permenant* and the socket where the
+       // Error returned is treated as *permanent* and the socket where the
        // data was read will be closed.
        // A temporary error may be handled by blocking this function, which
        // may block the HTTP parsing on the socket.

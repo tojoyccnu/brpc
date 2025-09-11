@@ -30,6 +30,7 @@ namespace bvar {
 DECLARE_int32(bvar_latency_p1);
 DECLARE_int32(bvar_latency_p2);
 DECLARE_int32(bvar_latency_p3);
+DECLARE_int32(bvar_max_dump_multi_dimension_metric_number);
 }
 
 namespace brpc {
@@ -53,6 +54,8 @@ public:
     }
 
     bool dump(const std::string& name, const butil::StringPiece& desc) override;
+    bool dump_mvar(const std::string& name, const butil::StringPiece& desc) override;
+    bool dump_comment(const std::string& name, const std::string& type) override;
 
 private:
     DISALLOW_COPY_AND_ASSIGN(PrometheusMetricsDumper);
@@ -81,6 +84,12 @@ private:
     std::map<std::string, SummaryItems> _m;
 };
 
+butil::StringPiece GetMetricsName(const std::string& name) {
+    auto pos = name.find_first_of('{');
+    int size = (pos == std::string::npos) ? name.size() : pos;
+    return butil::StringPiece(name.data(), size);
+}
+
 bool PrometheusMetricsDumper::dump(const std::string& name,
                                    const butil::StringPiece& desc) {
     if (!desc.empty() && desc[0] == '"') {
@@ -92,9 +101,27 @@ bool PrometheusMetricsDumper::dump(const std::string& name,
         // Leave it to DumpLatencyRecorderSuffix to output Summary.
         return true;
     }
-    *_os << "# HELP " << name << '\n'
-         << "# TYPE " << name << " gauge" << '\n'
+
+    auto metrics_name = GetMetricsName(name);
+
+    *_os << "# HELP " << metrics_name << '\n'
+         << "# TYPE " << metrics_name << " gauge" << '\n'
          << name << " " << desc << '\n';
+    return true;
+}
+
+bool PrometheusMetricsDumper::dump_mvar(const std::string& name, const butil::StringPiece& desc) {
+    if (!desc.empty() && desc[0] == '"') {
+        // there is no necessary to monitor string in prometheus
+        return true;
+    }
+    *_os << name << " " << desc << "\n";
+    return true;
+}
+
+bool PrometheusMetricsDumper::dump_comment(const std::string& name, const std::string& type) {
+    *_os << "# HELP " << name << '\n'
+         << "# TYPE " << name << " " << type << '\n';
     return true;
 }
 
@@ -171,6 +198,8 @@ bool PrometheusMetricsDumper::DumpLatencyRecorderSuffix(
          << si->latency_percentiles[4] << '\n'
          << si->metric_name << "{quantile=\"1\"} "
          << si->latency_percentiles[5] << '\n'
+         << si->metric_name << "{quantile=\"avg\"} "
+         << si->latency_avg << '\n'
          << si->metric_name << "_sum "
          // There is no sum of latency in bvar output, just use
          // average * count as approximation
@@ -200,6 +229,15 @@ int DumpPrometheusMetricsToIOBuf(butil::IOBuf* output) {
         return -1;
     }
     os.move_to(*output);
+
+    if (bvar::FLAGS_bvar_max_dump_multi_dimension_metric_number > 0) {
+        PrometheusMetricsDumper dumper_md(&os, g_server_info_prefix);
+        const int ndump_md = bvar::MVariableBase::dump_exposed(&dumper_md, NULL);
+        if (ndump_md < 0) {
+            return -1;
+        }
+        output->append(butil::IOBuf::Movable(os.buf()));
+    }
     return 0;
 }
 

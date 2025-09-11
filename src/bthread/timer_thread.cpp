@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// bthread - A M:N threading library to make applications more concurrent.
+// bthread - An M:N threading library to make applications more concurrent.
 
 
 #include <queue>                           // heap functions
@@ -23,6 +23,7 @@
 #include "butil/logging.h"
 #include "butil/third_party/murmurhash3/murmurhash3.h"   // fmix64
 #include "butil/resource_pool.h"
+#include "butil/threading/platform_thread.h"
 #include "bvar/bvar.h"
 #include "bthread/sys_futex.h"
 #include "bthread/timer_thread.h"
@@ -91,7 +92,7 @@ public:
     Task* consume_tasks();
 
 private:
-    internal::FastPthreadMutex _mutex;
+    FastPthreadMutex _mutex;
     int64_t _nearest_run_time;
     Task* _task_head;
 };
@@ -117,6 +118,7 @@ inline bool task_greater(const TimerThread::Task* a, const TimerThread::Task* b)
 }
 
 void* TimerThread::run_this(void* arg) {
+    butil::PlatformThread::SetName("brpc_timer");
     static_cast<TimerThread*>(arg)->run();
     return NULL;
 }
@@ -243,12 +245,12 @@ TimerThread::TaskId TimerThread::schedule(
 }
 
 // Notice that we don't recycle the Task in this function, let TimerThread::run
-// do it. The side effect is that we may allocated many unscheduled tasks before
-// TimerThread wakes up. The number is approximiately qps * timeout_s. Under the
+// do it. The side effect is that we may allocate many unscheduled tasks before
+// TimerThread wakes up. The number is approximately qps * timeout_s. Under the
 // precondition that ResourcePool<Task> caches 128K for each thread, with some
 // further calculations, we can conclude that in a RPC scenario:
 //   when timeout / latency < 2730 (128K / sizeof(Task))
-// unscheduled tasks do not occupy addititonal memory. 2730 is a large ratio
+// unscheduled tasks do not occupy additional memory. 2730 is a large ratio
 // between timeout and latency in most RPC scenarios, this is why we don't
 // try to reuse tasks right now inside unschedule() with more complicated code.
 int TimerThread::unschedule(TaskId task_id) {
@@ -345,6 +347,11 @@ void TimerThread::run() {
         // would run the consumed tasks.
         {
             BAIDU_SCOPED_LOCK(_mutex);
+            // This check of _stop ensures we won't miss the reset of _nearest_run_time
+            // to 0 in stop_and_join, avoiding potential race conditions.
+            if (BAIDU_UNLIKELY(_stop.load(butil::memory_order_relaxed))) {
+                break;
+            }
             _nearest_run_time = std::numeric_limits<int64_t>::max();
         }
         
@@ -367,11 +374,6 @@ void TimerThread::run() {
         bool pull_again = false;
         while (!tasks.empty()) {
             Task* task1 = tasks[0];  // the about-to-run task
-            if (task1->try_delete()) { // already unscheduled
-                std::pop_heap(tasks.begin(), tasks.end(), task_greater);
-                tasks.pop_back();
-                continue;
-            }
             if (butil::gettimeofday_us() < task1->run_time) {  // not ready yet.
                 break;
             }
@@ -406,21 +408,19 @@ void TimerThread::run() {
 
         // The realtime to wait for.
         int64_t next_run_time = std::numeric_limits<int64_t>::max();
-        if (tasks.empty()) {
-            next_run_time = std::numeric_limits<int64_t>::max();
-        } else {
+        if (!tasks.empty()) {
             next_run_time = tasks[0]->run_time;
         }
         // Similarly with the situation before running tasks, we check
         // _nearest_run_time to prevent us from waiting on a non-earliest
         // task. We also use the _nsignal to make sure that if new task 
-        // is earlier that the realtime that we wait for, we'll wake up.
+        // is earlier than the realtime that we wait for, we'll wake up.
         int expected_nsignals = 0;
         {
             BAIDU_SCOPED_LOCK(_mutex);
             if (next_run_time > _nearest_run_time) {
-                // a task is earlier that what we would wait for.
-                // We need to check buckets.
+                // a task is earlier than what we would wait for.
+                // We need to check the buckets.
                 continue;
             } else {
                 _nearest_run_time = next_run_time;

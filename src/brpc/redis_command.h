@@ -19,6 +19,7 @@
 #ifndef BRPC_REDIS_COMMAND_H
 #define BRPC_REDIS_COMMAND_H
 
+#include <limits>
 #include <memory>           // std::unique_ptr
 #include <vector>
 #include "butil/iobuf.h"
@@ -48,10 +49,11 @@ public:
     RedisCommandParser();
 
     // Parse raw message from `buf'. Return PARSE_OK and set the parsed command
-    // to `commands' and length to `len' if successful. Memory of commands are
-    // allocated in `arena'.
-    ParseError Consume(butil::IOBuf& buf, std::vector<const char*>* commands,
+    // to `args' and length to `len' if successful. Memory of args are allocated 
+    // in `arena'.
+    ParseError Consume(butil::IOBuf& buf, std::vector<butil::StringPiece>* args,
                        butil::Arena* arena);
+    size_t ParsedArgsSize();
 
 private:
     // Reset parser to the initial state.
@@ -60,7 +62,7 @@ private:
     bool _parsing_array;            // if the parser has met array indicator '*'
     int _length;                    // array length
     int _index;                     // current parsing array index
-    std::vector<const char*> _commands;  // parsed command string
+    std::vector<butil::StringPiece> _args;  // parsed command string
 };
 
 } // namespace brpc
