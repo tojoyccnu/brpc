@@ -53,8 +53,8 @@ else()
 endif()
 
 set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} ${DEFINE_CLOCK_GETTIME} -DBRPC_WITH_GLOG=${WITH_GLOG_VAL} -DBRPC_WITH_RDMA=${WITH_RDMA_VAL}")
-set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -DBTHREAD_USE_FAST_PTHREAD_MUTEX -D__const__=__unused__ -D_GNU_SOURCE -DUSE_SYMBOLIZE -DNO_TCMALLOC -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -DUNIT_TEST -Dprivate=public -Dprotected=public -DBVAR_NOT_LINK_DEFAULT_VARIABLES -D__STRICT_ANSI__ -include ${PROJECT_SOURCE_DIR}/test/sstream_workaround.h")
-set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS} -g -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer")
+set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -DBTHREAD_USE_FAST_PTHREAD_MUTEX -D__const__=__unused__ -D_GNU_SOURCE -DUSE_SYMBOLIZE -DNO_TCMALLOC -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -DUNIT_TEST -DBVAR_NOT_LINK_DEFAULT_VARIABLES -D__STRICT_ANSI__")
+set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS} -g -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer -fno-access-control")
 use_cxx11()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -216,6 +216,11 @@ if(BRPC_WITH_GLOG)
     target_link_libraries(brpc-shared-debug ${GLOG_LIB})
 endif()
 
+# AddressSanitizer is incompatible with tcmalloc/gperftools, do not link it when WITH_ASAN is on
+if(WITH_ASAN)
+    set(GPERFTOOLS_LIBRARIES "")
+endif()
+
 # test_butil
 add_executable(test_butil ${TEST_BUTIL_SOURCES}
                           ${CMAKE_CURRENT_BINARY_DIR}/iobuf.pb.cc)
@@ -275,7 +280,10 @@ if(BUILD_FUZZ_TESTS)
     endif()
 
     set(FUZZ_TARGETS fuzz_butil fuzz_esp fuzz_hpack fuzz_http
-        fuzz_hulu fuzz_json fuzz_redis fuzz_shead fuzz_sofa fuzz_uri)
+        fuzz_hulu fuzz_json fuzz_redis fuzz_shead fuzz_sofa fuzz_uri
+        fuzz_baidu_rpc fuzz_mongo fuzz_memcache
+        fuzz_couchbase fuzz_streaming fuzz_http_parser fuzz_amf)
+
 
     foreach(target ${FUZZ_TARGETS})
         add_executable(${target} fuzzing/${target}.cpp $<TARGET_OBJECTS:TEST_PROTO_LIB>)

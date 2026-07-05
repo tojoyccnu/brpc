@@ -42,6 +42,7 @@
 #include "brpc/event_dispatcher.h"
 #include "brpc/versioned_ref_with_id.h"
 #include "brpc/health_check_option.h"
+#include "brpc/socket_mode.h"
 
 namespace brpc {
 namespace policy {
@@ -55,12 +56,17 @@ class ChannelBalancer;
 namespace rdma {
 class RdmaEndpoint;
 class RdmaConnect;
+class RdmaHandshakeClientV2;
+class RdmaHandshakeServerV2;
+class RdmaHandshakeClientV3;
+class RdmaHandshakeServerV3;
 }
 
 class Socket;
 class AuthContext;
 class EventDispatcher;
 class Stream;
+class Transport;
 
 // A special closure for processing the about-to-recycle socket. Socket does
 // not delete SocketUser, if you want, `delete this' at the end of
@@ -250,6 +256,8 @@ struct SocketOptions {
     // user->BeforeRecycle() before recycling.
     int fd{-1};
     butil::EndPoint remote_side;
+    butil::EndPoint local_side;
+    std::string device_name;
     // If `connect_on_create' is true and `fd' is less than 0,
     // a client connection will be established to remote_side()
     // regarding deadline `connect_abstime' when Socket is being created.
@@ -266,11 +274,20 @@ struct SocketOptions {
     // until new data arrives. The callback will not be called from more than
     // one thread at any time.
     void (*on_edge_triggered_events)(Socket*){NULL};
+    // Indicates that this socket requires an edge-triggered event handler even
+    // if `on_edge_triggered_events` is left as NULL by the caller. When this
+    // flag is true and `on_edge_triggered_events` is NULL, the underlying
+    // transport-specific implementation (e.g. a transport subclass) is allowed
+    // to install a suitable default `on_edge_triggered_events` callback on
+    // behalf of the user. Typical usage is by transports/protocols that rely
+    // on edge-triggered I/O semantics but want the framework to provide the
+    // actual event handler.
+    bool need_on_edge_trigger{false};
     int health_check_interval_s{-1};
     // Only accept ssl connection.
     bool force_ssl{false};
     std::shared_ptr<SocketSSLContext> initial_ssl_ctx;
-    bool use_rdma{false};
+    SocketMode socket_mode{SOCKET_MODE_TCP};
     bthread_keytable_pool_t* keytable_pool{NULL};
     SocketConnection* conn{NULL};
     std::shared_ptr<AppConnect> app_connect;
@@ -304,6 +321,10 @@ friend class policy::RtmpContext;
 friend class schan::ChannelBalancer;
 friend class rdma::RdmaEndpoint;
 friend class rdma::RdmaConnect;
+friend class rdma::RdmaHandshakeClientV2;
+friend class rdma::RdmaHandshakeServerV2;
+friend class rdma::RdmaHandshakeClientV3;
+friend class rdma::RdmaHandshakeServerV3;
 friend class HealthCheckTask;
 friend class OnAppHealthCheckDone;
 friend class HealthCheckManager;
@@ -311,6 +332,10 @@ friend class policy::H2GlobalStreamCreator;
 friend class VersionedRefWithId<Socket>;
 friend class IOEvent<Socket>;
 friend void DereferenceSocket(Socket*);
+friend class Transport;
+friend class TcpTransport;
+friend class RdmaTransport;
+friend class TransportFactory;
     class SharedPart;
     struct WriteRequest;
 
@@ -648,13 +673,6 @@ public:
 private:
     DISALLOW_COPY_AND_ASSIGN(Socket);
 
-    // The on/off state of RDMA
-    enum RdmaState {
-        RDMA_ON,
-        RDMA_OFF,
-        RDMA_UNKNOWN
-    };
-
     int ConductError(bthread_id_t);
     int StartWrite(WriteRequest*, const WriteOptions&);
 
@@ -730,7 +748,6 @@ private:
     // Wait until nref hits `expected_nref' and reset some internal resources.
     int WaitAndReset(int32_t expected_nref);
 
-    static void* ProcessEvent(void*);
 
     static void* KeepWrite(void*);
 
@@ -830,11 +847,14 @@ private:
     // Address of self. Initialized in ResetFileDescriptor().
     butil::EndPoint _local_side;
 
+    // The device name of the client's network adapter.
+    std::string _device_name;
+
     // Called when edge-triggered events happened on `_fd'. Read comments
     // of EventDispatcher::AddConsumer (event_dispatcher.h)
     // carefully before implementing the callback.
     void (*_on_edge_triggered_events)(Socket*);
-
+    bool _need_on_edge_trigger;
     // A set of callbacks to monitor important events of this socket.
     // Initialized by SocketOptions.user
     SocketUser* _user;
@@ -913,10 +933,9 @@ private:
     SSL* _ssl_session;               // owner
     std::shared_ptr<SocketSSLContext> _ssl_ctx;
 
-    // The RdmaEndpoint
-    rdma::RdmaEndpoint* _rdma_ep;
-    // Should use RDMA or not
-    RdmaState _rdma_state;
+    // Should use SOCKET_MODE_RDMA or SOCKET_MODE_TCP or Other, default is SOCKET_MODE_TCP Transport
+    SocketMode _socket_mode;
+    std::unique_ptr<Transport> _transport;
 
     // Pass from controller, for progressive reading.
     ConnectionType _connection_type_for_progressive_read;

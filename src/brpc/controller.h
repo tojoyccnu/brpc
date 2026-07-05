@@ -25,6 +25,7 @@
 #include <functional>                          // std::function
 #include <gflags/gflags.h>                     // Users often need gflags
 #include <string>
+#include <memory>
 #include "butil/intrusive_ptr.hpp"             // butil::intrusive_ptr
 #include "bthread/errno.h"                     // Redefine errno
 #include "butil/endpoint.h"                    // butil::EndPoint
@@ -151,6 +152,7 @@ friend void policy::ProcessThriftRequest(InputMessageBase*);
     static const uint32_t FLAGS_PB_SINGLE_REPEATED_TO_ARRAY = (1 << 20);
     static const uint32_t FLAGS_MANAGE_HTTP_BODY_ON_ERROR = (1 << 21);
     static const uint32_t FLAGS_WRITE_TO_SOCKET_IN_BACKGROUND = (1 << 22);
+    static const uint32_t FLAGS_ENDING_RPC = (1 << 23);
 
 public:
     struct Inheritable {
@@ -795,6 +797,8 @@ private:
         return has_flag(FLAGS_ENABLED_CIRCUIT_BREAKER); 
     }
 
+    bool is_ending_rpc() const { return has_flag(FLAGS_ENDING_RPC); }
+
     std::string& protocol_param() { return _thrift_method_name; }
     const std::string& protocol_param() const { return _thrift_method_name; }
 
@@ -803,7 +807,7 @@ private:
 private:
     // NOTE: align and group fields to make Controller as compact as possible.
 
-    Span* _span;
+    std::weak_ptr<Span> _span;
     uint32_t _flags; // all boolean fields inside Controller
     int32_t _error_code;
     std::string _error_text;

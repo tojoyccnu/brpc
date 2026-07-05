@@ -44,6 +44,10 @@ ifeq ($(shell test $(GCC_VERSION) -ge 40400; echo $$?),0)
     CXXFLAGS+=-msse4 -msse4.2
   endif
 endif
+# RISC-V specific optimizations
+ifeq ($(shell uname -m),riscv64)
+  CXXFLAGS+=-march=rv64gc
+endif
 #not solved yet
 ifeq ($(CC),gcc)
   ifeq ($(shell test $(GCC_VERSION) -ge 70000; echo $$?),0)
@@ -198,7 +202,7 @@ JSON2PB_DIRS = src/json2pb
 JSON2PB_SOURCES = $(foreach d,$(JSON2PB_DIRS),$(wildcard $(addprefix $(d)/*,$(SRCEXTS))))
 JSON2PB_OBJS = $(addsuffix .o, $(basename $(JSON2PB_SOURCES))) 
 
-BRPC_DIRS = src/brpc src/brpc/details src/brpc/builtin src/brpc/policy src/brpc/rdma
+BRPC_DIRS = src/brpc src/brpc/details src/brpc/builtin src/brpc/policy src/brpc/policy/mysql src/brpc/rdma
 THRIFT_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/thrift*,$(SRCEXTS))))
 EXCLUDE_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/event_dispatcher_*,$(SRCEXTS))))
 BRPC_SOURCES_ALL = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/*,$(SRCEXTS))))

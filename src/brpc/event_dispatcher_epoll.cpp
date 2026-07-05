@@ -78,6 +78,7 @@ int EventDispatcher::Start(const bthread_attr_t* thread_attr) {
     // Only event dispatcher thread has flag BTHREAD_GLOBAL_PRIORITY.
     bthread_attr_t epoll_thread_attr =
         _thread_attr | BTHREAD_NEVER_QUIT | BTHREAD_GLOBAL_PRIORITY;
+    bthread_attr_set_name(&epoll_thread_attr, "EventDispatcher::RunThis");
 
     // Polling thread uses the same attr for consumer threads (NORMAL right
     // now). Previously, we used small stack (32KB) which may be overflowed
@@ -189,7 +190,13 @@ int EventDispatcher::RemoveConsumer(int fd) {
 }
 
 void* EventDispatcher::RunThis(void* arg) {
-    ((EventDispatcher*)arg)->Run();
+    EventDispatcher* ed = (EventDispatcher*)arg;
+    if (ed->_priority_index >= 0) {
+        bthread::TaskMeta* meta =
+            bthread::TaskGroup::address_meta(bthread_self());
+        meta->priority_index = ed->_priority_index;
+    }
+    ed->Run();
     return NULL;
 }
 

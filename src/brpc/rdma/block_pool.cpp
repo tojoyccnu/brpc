@@ -25,9 +25,8 @@
 #include "butil/iobuf.h"
 #include "butil/object_pool.h"
 #include "butil/thread_local.h"
-#include "bthread/bthread.h"
+#include "butil/memory/scope_guard.h"
 #include "brpc/rdma/block_pool.h"
-
 
 namespace brpc {
 namespace rdma {
@@ -42,6 +41,8 @@ DEFINE_int32(rdma_memory_pool_tls_cache_num, 128, "Number of cached block in tls
 DEFINE_bool(rdma_memory_pool_user_specified_memory, false,
             "If true, the user must call UserExtendBlockPool() to extend "
             "memory. bRPC will not handle memory extension.");
+DEFINE_string(rdma_recv_block_type, "default", "Default size type for recv WR: "
+              "default(8KB - 32B)/large(64KB - 32B)/huge(2MB - 32B)");
 
 static RegisterCallback g_cb = NULL;
 
@@ -49,8 +50,8 @@ static RegisterCallback g_cb = NULL;
 static const size_t BYTES_IN_MB = 1048576;
 
 static const int BLOCK_DEFAULT = 0; // 8KB
-// static const int BLOCK_LARGE = 1;  // 64KB
-// static const int BLOCK_HUGE = 2;  // 2MB
+static const int BLOCK_LARGE = 1;  // 64KB
+static const int BLOCK_HUGE = 2;  // 2MB
 static const int BLOCK_SIZE_COUNT = 3;
 static size_t g_block_size[BLOCK_SIZE_COUNT] = { 8192, 65536, 2 * BYTES_IN_MB };
 
@@ -98,6 +99,8 @@ struct GlobalInfo {
     std::vector<size_t> idle_size[BLOCK_SIZE_COUNT];
     int region_num[BLOCK_SIZE_COUNT];
     butil::Mutex extend_lock;
+    std::vector<IdleNode*> expansion_list[BLOCK_SIZE_COUNT];
+    std::vector<size_t> expansion_size[BLOCK_SIZE_COUNT];
 };
 static GlobalInfo* g_info = NULL;
 
@@ -129,36 +132,20 @@ uint32_t GetRegionId(const void* buf) {
     return r->id;
 }
 
-// When both rdma_memory_pool_max_regions and rdma_memory_pool_buckets are
-// greater than 1, dynamic memory expansion may cause concurrent modification
-// issues in the memory linked list due to lock contention problems. To address
-// this, we increase the region_num count for each block_type. Dynamic memory
-// expansion is only permitted when both of the following conditions are met:
-// rdma_memory_pool_buckets equals 1
-// g_info->region_num[block_type] is less than 1
-static bool CanExtendBlockRuntime(int block_type) {
-    return FLAGS_rdma_memory_pool_buckets == 1 ||
-           g_info->region_num[block_type] < 1;
-}
+static void* ExtendBlockPoolImpl(void* region_base, size_t region_size, int block_type) {
+    auto region_base_guard = butil::MakeScopeGuard([region_base]() {
+        free(region_base);
+    });
 
-static void* ExtendBlockPoolImpl(void* region_base, size_t region_size,
-                                 int block_type) {
-    if (CanExtendBlockRuntime(block_type) == false) {
-        LOG(INFO) << "Runtime extend memory only support one bucket or region "
-                     "num is zero for per block_type";
-        free(region_base);
-        errno = ENOMEM;
-        return NULL;
-    }
     if (g_region_num == FLAGS_rdma_memory_pool_max_regions) {
-        LOG(INFO) << "Memory pool reaches max regions";
-        free(region_base);
+        LOG_EVERY_SECOND(ERROR) << "Memory pool reaches max regions";
         errno = ENOMEM;
         return NULL;
     }
+
     uint32_t id = g_cb(region_base, region_size);
     if (id == 0) {
-        free(region_base);
+        errno = EINVAL;
         return NULL;
     }
 
@@ -170,7 +157,7 @@ static void* ExtendBlockPoolImpl(void* region_base, size_t region_size,
             for (size_t j = 0; j < i; ++j) {
                 butil::return_object<IdleNode>(node[j]);
             }
-            free(region_base);
+            errno = ENOMEM;
             return NULL;
         }
     }
@@ -184,18 +171,21 @@ static void* ExtendBlockPoolImpl(void* region_base, size_t region_size,
     for (size_t i = 0; i < g_buckets; ++i) {
         node[i]->start = (void*)(region->start + i * (region_size / g_buckets));
         node[i]->len = region_size / g_buckets;
-        node[i]->next = g_info->idle_list[block_type][i];
-        g_info->idle_list[block_type][i] = node[i];
-        g_info->idle_size[block_type][i] += node[i]->len;
+        node[i]->next = g_info->expansion_list[block_type][i];
+        g_info->expansion_list[block_type][i] = node[i];
+        g_info->expansion_size[block_type][i] += node[i]->len;
     }
     g_info->region_num[block_type]++;
+
+    // `region_base' is inuse, cannot be freed.
+    region_base_guard.dismiss();
 
     return region_base;
 }
 
 // Extend the block pool with a new region (with different region ID)
 static void* ExtendBlockPool(size_t region_size, int block_type) {
-    if (region_size < 1) {
+    if (region_size < 1 || block_type < 0) {
         errno = EINVAL;
         return NULL;
     }
@@ -203,7 +193,7 @@ static void* ExtendBlockPool(size_t region_size, int block_type) {
     if (FLAGS_rdma_memory_pool_user_specified_memory) {
         LOG_EVERY_SECOND(ERROR) << "Fail to extend new region, "
                                    "rdma_memory_pool_user_specified_memory is "
-                                   "true,  ExtendBlockPool is disabled";
+                                   "true, ExtendBlockPool is disabled";
         return NULL;
     }
 
@@ -222,24 +212,27 @@ static void* ExtendBlockPool(size_t region_size, int block_type) {
     return ExtendBlockPoolImpl(region_base, region_size, block_type);
 }
 
-void* ExtendBlockPoolByUser(void* region_base, size_t region_size,
-                            int block_type) {
-    if (FLAGS_rdma_memory_pool_user_specified_memory == false) {
+void* ExtendBlockPoolByUser(void* region_base, size_t region_size, int block_type) {
+    auto region_base_guard = butil::MakeScopeGuard([region_base]() {
+        free(region_base);
+    });
+
+    if (!FLAGS_rdma_memory_pool_user_specified_memory) {
         LOG_EVERY_SECOND(ERROR) << "User extend memory is disabled";
         return NULL;
     }
     if (reinterpret_cast<uintptr_t>(region_base) % 4096 != 0) {
         LOG_EVERY_SECOND(ERROR) << "region_base must be 4096 aligned";
+        errno = EINVAL;
         return NULL;
     }
 
-    uint64_t index = butil::fast_rand() % g_buckets;
-    BAIDU_SCOPED_LOCK(*g_info->lock[block_type][index]);
-    BAIDU_SCOPED_LOCK(g_info->extend_lock);
     region_size =
         region_size * BYTES_IN_MB / g_block_size[block_type] / g_buckets;
     region_size *= g_block_size[block_type] * g_buckets;
 
+    region_base_guard.dismiss();
+    BAIDU_SCOPED_LOCK(g_info->extend_lock);
     return ExtendBlockPoolImpl(region_base, region_size, block_type);
 }
 
@@ -316,6 +309,14 @@ bool InitBlockPool(RegisterCallback cb) {
                 return false;
             }
         }
+        g_info->expansion_list[i].resize(g_buckets, NULL);
+        if (g_info->expansion_list[i].size() != g_buckets) {
+            return false;
+        }
+        g_info->expansion_size[i].resize(g_buckets, 0);
+        if (g_info->expansion_size[i].size() != g_buckets) {
+            return false;
+        }
     }
 
     g_dump_mutex = new butil::Mutex;
@@ -326,10 +327,19 @@ bool InitBlockPool(RegisterCallback cb) {
     }
 
     if (ExtendBlockPool(FLAGS_rdma_memory_pool_initial_size_mb,
-                        BLOCK_DEFAULT) != NULL) {
+                        GetRdmaBlockType()) != NULL) {
         return true;
     }
     return false;
+}
+
+static void MoveExpansionList2EmptyIdleList(int block_type, size_t index) {
+    CHECK(NULL == g_info->idle_list[block_type][index]);
+
+    g_info->idle_list[block_type][index] = g_info->expansion_list[block_type][index];
+    g_info->idle_size[block_type][index] += g_info->expansion_size[block_type][index];
+    g_info->expansion_list[block_type][index] = NULL;
+    g_info->expansion_size[block_type][index] = 0;
 }
 
 static void* AllocBlockFrom(int block_type) {
@@ -338,60 +348,59 @@ static void* AllocBlockFrom(int block_type) {
         g_dump_mutex->lock();
         locked = true;
     }
+    BUTIL_SCOPE_EXIT {
+        if (locked) {
+            g_dump_mutex->unlock();
+        }
+    };
+
     void* ptr = NULL;
-    if (block_type == 0 && tls_idle_list != NULL){
+    if (0 == block_type && NULL != tls_idle_list) {
         CHECK(tls_idle_num > 0);
         IdleNode* n = tls_idle_list;
         tls_idle_list = n->next;
         ptr = n->start;
         butil::return_object<IdleNode>(n);
         tls_idle_num--;
-        if (locked) {
-            g_dump_mutex->unlock();
-        }
         return ptr;
     }
 
-    uint64_t index = butil::fast_rand() % g_buckets;
+    size_t index = butil::fast_rand() % g_buckets;
     BAIDU_SCOPED_LOCK(*g_info->lock[block_type][index]);
     IdleNode* node = g_info->idle_list[block_type][index];
-    if (!node) {
+    if (NULL == node) {
         BAIDU_SCOPED_LOCK(g_info->extend_lock);
         node = g_info->idle_list[block_type][index];
-        if (!node) {
-            // There is no block left, extend a new region
-            if (!ExtendBlockPool(FLAGS_rdma_memory_pool_increase_size_mb,
-                                 block_type)) {
+        if (NULL == node && NULL != g_info->expansion_list[block_type][index]) {
+            MoveExpansionList2EmptyIdleList(block_type, index);
+            node = g_info->idle_list[block_type][index];
+        }
+        if (NULL == node) {
+            // There is no block left, extend a new region.
+            if (!ExtendBlockPool(FLAGS_rdma_memory_pool_increase_size_mb, block_type)) {
                 LOG_EVERY_SECOND(ERROR) << "Fail to extend new region. "
                                         << "You can set the size of memory pool larger. "
                                         << "Refer to the help message of these flags: "
                                         << "rdma_memory_pool_initial_size_mb, "
                                         << "rdma_memory_pool_increase_size_mb, "
                                         << "rdma_memory_pool_max_regions.";
-                if (locked) {
-                    g_dump_mutex->unlock();
-                }
                 return NULL;
             }
+            MoveExpansionList2EmptyIdleList(block_type, index);
             node = g_info->idle_list[block_type][index];
         }
     }
-    if (node) {
-        ptr = node->start;
-        if (node->len > g_block_size[block_type]) {
-            node->start = (char*)node->start + g_block_size[block_type];
-            node->len -= g_block_size[block_type];
-        } else {
-            g_info->idle_list[block_type][index] = node->next;
-            butil::return_object<IdleNode>(node);
-        }
-        g_info->idle_size[block_type][index] -= g_block_size[block_type];
+    CHECK(NULL != node);
+
+    ptr = node->start;
+    if (node->len > g_block_size[block_type]) {
+        node->start = (char*)node->start + g_block_size[block_type];
+        node->len -= g_block_size[block_type];
     } else {
-        if (locked) {
-            g_dump_mutex->unlock();
-        }
-        return NULL;
+        g_info->idle_list[block_type][index] = node->next;
+        butil::return_object<IdleNode>(node);
     }
+    g_info->idle_size[block_type][index] -= g_block_size[block_type];
 
     // Move more blocks from global list to tls list
     if (block_type == 0) {
@@ -417,9 +426,6 @@ static void* AllocBlockFrom(int block_type) {
         }
     }
 
-    if (locked) {
-        g_dump_mutex->unlock();
-    }
     return ptr;
 }
 
@@ -482,6 +488,12 @@ int DeallocBlock(void* buf) {
         g_dump_mutex->lock();
         locked = true;
     }
+    BUTIL_SCOPE_EXIT {
+        if (locked) {
+            g_dump_mutex->unlock();
+        }
+    };
+
     if (block_type == 0 && tls_idle_num < (uint32_t)FLAGS_rdma_memory_pool_tls_cache_num) {
         if (!tls_inited) {
             tls_inited = true;
@@ -494,9 +506,6 @@ int DeallocBlock(void* buf) {
         tls_idle_num++;
         node->next = tls_idle_list;
         tls_idle_list = node;
-        if (locked) {
-            g_dump_mutex->unlock();
-        }
         return 0;
     }
 
@@ -527,14 +536,39 @@ int DeallocBlock(void* buf) {
         g_info->idle_list[block_type][index] = node;
         g_info->idle_size[block_type][index] += node->len;
     }
-    if (locked) {
-        g_dump_mutex->unlock();
-    }
     return 0;
 }
 
 size_t GetBlockSize(int type) {
     return g_block_size[type];
+}
+
+size_t GetRdmaBlockSize() {
+    if (FLAGS_rdma_recv_block_type == "default") {
+        return GetBlockSize(0);
+    } else if (FLAGS_rdma_recv_block_type == "large") {
+        return GetBlockSize(1);
+    } else if (FLAGS_rdma_recv_block_type == "huge") {
+        return GetBlockSize(2);
+    } else {
+        LOG(ERROR) << "rdma_recv_block_type incorrect "
+                   << "(valid value: default/large/huge)";
+        return 0;
+    }
+}
+
+int GetRdmaBlockType() {
+    if (FLAGS_rdma_recv_block_type == "default") {
+        return BLOCK_DEFAULT;
+    } else if (FLAGS_rdma_recv_block_type == "large") {
+        return BLOCK_LARGE;
+    } else if (FLAGS_rdma_recv_block_type == "huge") {
+        return BLOCK_HUGE;
+    } else {
+        LOG(ERROR) << "rdma_recv_block_type incorrect "
+                   << "(valid value: default/large/huge)";
+        return -1;
+    }
 }
 
 void DumpMemoryPoolInfo(std::ostream& os) {
@@ -557,7 +591,8 @@ void DumpMemoryPoolInfo(std::ostream& os) {
     for (int i = 0; i < BLOCK_SIZE_COUNT; ++i) {
         os << "\tFor block size " << GetBlockSize(i) << ":\n";
         for (size_t j = 0; j < g_buckets; ++j) {
-            os << "\t\tBucket " << j << ": " << g_info->idle_size[i][j] << "\n";
+            os << "\t\tBucket " << j << ": {" << g_info->idle_size[i][j]
+               << ", " << g_info->expansion_size[i][j] << "}\n";
         }
     }
     os << "Thread Local Cache Info:\n";
@@ -580,10 +615,17 @@ void DestroyBlockPool() {
                 node = tmp;
             }
             g_info->idle_list[i][j] = NULL;
+            // Release the per-bucket mutexes allocated in InitBlockPool.
+            delete g_info->lock[i][j];
+            g_info->lock[i][j] = NULL;
         }
     }
     delete g_info;
     g_info = NULL;
+    delete g_dump_mutex;
+    g_dump_mutex = NULL;
+    delete g_tls_info_mutex;
+    g_tls_info_mutex = NULL;
     for (int i = 0; i < g_region_num; ++i) {
         if (g_regions[i].start == 0) {
             break;

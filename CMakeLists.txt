@@ -40,7 +40,7 @@ if(POLICY CMP0042)
     cmake_policy(SET CMP0042 NEW)
 endif()
 
-set(BRPC_VERSION 1.15.0)
+set(BRPC_VERSION 1.17.0)
 
 SET(CPACK_GENERATOR "DEB")
 SET(CPACK_DEBIAN_PACKAGE_MAINTAINER "brpc authors")
@@ -146,7 +146,7 @@ if(WITH_MESALINK)
 endif()
 set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -DBTHREAD_USE_FAST_PTHREAD_MUTEX -D__const__=__unused__ -D_GNU_SOURCE -DUSE_SYMBOLIZE -DNO_TCMALLOC -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -DBRPC_REVISION=\\\"${BRPC_REVISION}\\\" -D__STRICT_ANSI__")
 set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} ${DEBUG_SYMBOL} ${THRIFT_CPP_FLAG}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS} -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer")
+set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS} ${CMAKE_CXX_FLAGS} -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer")
 set(CMAKE_C_FLAGS "${CMAKE_CPP_FLAGS} -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-unused-parameter -fno-omit-frame-pointer")
 
 macro(use_cxx11)
@@ -170,6 +170,14 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     elseif((CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64"))
         # segmentation fault in libcontext
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-gcse")
+    elseif((CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64"))
+        # RISC-V specific optimizations
+        option(WITH_RISCV_ZBC "Enable RISC-V Zbc carry-less multiplication for CRC32C acceleration" OFF)
+        if(WITH_RISCV_ZBC)
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gc_zbc")
+        else()
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gc")
+        endif()
     endif()
     if(NOT (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7.0))
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-aligned-new")
@@ -203,11 +211,13 @@ if(Protobuf_VERSION GREATER 4.21)
         absl::hash
         absl::layout
         absl::log_initialize
+        absl::log_globals
         absl::log_severity
         absl::memory
         absl::node_hash_map
         absl::node_hash_set
-        absl::optional
+        absl::random_distributions
+        absl::random_random
         absl::span
         absl::status
         absl::statusor
@@ -545,7 +555,8 @@ set(PROTO_FILES idl_options.proto
                 brpc/policy/mongo.proto
                 brpc/trackme.proto
                 brpc/streaming_rpc_meta.proto
-                brpc/proto_base.proto)
+                brpc/proto_base.proto
+                brpc/rdma/rdma_handshake.proto)
 file(MAKE_DIRECTORY ${PROJECT_BINARY_DIR}/output/include/brpc)
 set(PROTOC_FLAGS ${PROTOC_FLAGS} -I${PROTOBUF_INCLUDE_DIR})
 compile_proto(PROTO_HDRS PROTO_SRCS ${PROJECT_BINARY_DIR}
